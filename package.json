@@ -1,0 +1,20 @@
+{
+  "name": "ai-powered-trade-journal-analysis",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev": "npm run dev:frontend",
+    "dev:frontend": "npm run dev --workspace frontend",
+    "dev:backend": "npm run dev --workspace backend",
+    "build": "npm run build --workspace frontend",
+    "preview": "npm run preview --workspace frontend"
+  },
+  "devDependencies": {
+    "shadcn": "^4.7.0"
+  }
+}
