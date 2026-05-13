@@ -31,9 +31,10 @@ import {
   SquareTerminal,
   Target,
   WalletCards,
+  X,
   Zap
 } from "lucide-react";
-import { candlesFor, initialHoldings, initialJournal, news as mockNews, watchlist } from "@/data/mock";
+import { candlesFor, news as mockNews, watchlist } from "@/data/mock";
 import { analyzeMarket, chatAboutMarket } from "@/lib/ai";
 import { currency, number, signed } from "@/lib/format";
 import { getMarketCandles, getMarketNews, getQuote, marketStreamUrl, type MarketQuote } from "@/lib/market";
@@ -118,24 +119,38 @@ function useMarketData(symbol: SymbolKey, resolution = "D") {
 
   useEffect(() => {
     let active = true;
-    setCandles(fallback);
-    setMarketNews(mockNews.filter((item) => item.symbol === symbol || item.symbol === "MARKET"));
     setIsLoading(true);
     setError(null);
-    Promise.allSettled([getMarketCandles(symbol, resolution), getQuote(symbol), getMarketNews(symbol)]).then((results) => {
+    getMarketCandles(symbol, resolution).then((data) => {
       if (!active) return;
-      const [candleResult, quoteResult, newsResult] = results;
-      if (candleResult.status === "fulfilled" && candleResult.value.length) setCandles(candleResult.value);
-      if (quoteResult.status === "fulfilled") setQuote(quoteResult.value);
-      if (newsResult.status === "fulfilled" && newsResult.value.length) setMarketNews(newsResult.value);
-      const rejected = results.find((result) => result.status === "rejected");
-      setError(rejected && rejected.status === "rejected" ? rejected.reason.message : null);
+      if (data.length) setCandles(data);
+    }).catch((err) => {
+      if (!active) return;
+      setError(err instanceof Error ? err.message : "Market candles request failed.");
+    }).finally(() => {
+      if (!active) return;
       setIsLoading(false);
     });
     return () => {
       active = false;
     };
-  }, [fallback, resolution, symbol]);
+  }, [resolution, symbol]);
+
+  useEffect(() => {
+    let active = true;
+    setCandles(fallback);
+    setMarketNews(mockNews.filter((item) => item.symbol === symbol || item.symbol === "MARKET"));
+    setQuote(null);
+    Promise.allSettled([getQuote(symbol), getMarketNews(symbol)]).then((results) => {
+      if (!active) return;
+      const [quoteResult, newsResult] = results;
+      if (quoteResult.status === "fulfilled") setQuote(quoteResult.value);
+      if (newsResult.status === "fulfilled" && newsResult.value.length) setMarketNews(newsResult.value);
+    });
+    return () => {
+      active = false;
+    };
+  }, [fallback, symbol]);
 
   useEffect(() => {
     if (!stockSymbolsForLive.has(symbol)) {
@@ -190,20 +205,68 @@ function selectedQuote(symbol: SymbolKey, quote: MarketQuote | null): WatchSymbo
 }
 
 const stockSymbolsForLive = new Set<SymbolKey>(["NVDA", "AAPL", "TSLA", "MSFT", "AMD"]);
+const watchlistUniverse = watchlist;
 
 export default function App() {
-  const [journalRows, setJournalRows] = useState<AuditRow[]>(defaultAuditRows);
-  const [portfolioRows, setPortfolioRows] = useState<Holding[]>(initialHoldings);
+  const [journalRows, setJournalRows] = useState<AuditRow[]>([]);
+  const [portfolioRows, setPortfolioRows] = useState<Holding[]>([]);
+  const [watchlistRows, setWatchlistRows] = useState<WatchSymbol[]>(watchlist);
+  const [quotesBySymbol, setQuotesBySymbol] = useState<Partial<Record<SymbolKey, MarketQuote>>>({});
   const [simTick, setSimTick] = useState(0);
+  const [dashboardSymbol, setDashboardSymbol] = useState<SymbolKey>(watchlist[0].symbol);
 
-  // Simulate live price ticking for mock data feel
+  // Persist journal + portfolio in localStorage (no DB required)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("qj_journal");
+      if (saved) setJournalRows(JSON.parse(saved));
+    } catch { /* ignore */ }
+  }, []);
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("qj_portfolio");
+      if (saved) setPortfolioRows(JSON.parse(saved));
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    const refreshQuotes = () => {
+      Promise.allSettled(
+        watchlistRows
+          .filter((item) => stockSymbolsForLive.has(item.symbol))
+          .map((item) => getQuote(item.symbol))
+      ).then((results) => {
+        const nextQuotes: Partial<Record<SymbolKey, MarketQuote>> = {};
+        for (const result of results) {
+          if (result.status === "fulfilled") nextQuotes[result.value.symbol] = result.value;
+        }
+        if (Object.keys(nextQuotes).length) {
+          setQuotesBySymbol((current) => ({ ...current, ...nextQuotes }));
+        }
+      });
+    };
+    refreshQuotes();
+    const timer = setInterval(refreshQuotes, 30_000);
+    return () => clearInterval(timer);
+  }, [watchlistRows]);
+
+  // Keep non-API symbols moving slightly so crypto/FX mock rows don't look frozen.
   useEffect(() => {
     const timer = setInterval(() => setSimTick((s) => s + 1), 5000);
     return () => clearInterval(timer);
   }, []);
 
   const liveWatchlist = useMemo(() => {
-    return watchlist.map((item) => {
+    return watchlistRows.map((item) => {
+      const quote = quotesBySymbol[item.symbol];
+      if (quote) {
+        return {
+          ...item,
+          last: quote.last,
+          change: quote.change,
+          changePercent: quote.changePercent
+        };
+      }
       const drift = (Math.sin(simTick + item.symbol.length) * 0.05);
       const newLast = item.last + drift;
       return {
@@ -213,20 +276,55 @@ export default function App() {
         changePercent: item.changePercent + (drift / item.last) * 100
       };
     });
-  }, [simTick]);
+  }, [quotesBySymbol, simTick, watchlistRows]);
 
-  const addJournalEntry = (row: AuditRow) => setJournalRows((prev) => [row, ...prev]);
-  const addPortfolioHolding = (holding: Omit<Holding, "id">) => setPortfolioRows((prev) => [{ ...holding, id: crypto.randomUUID() }, ...prev]);
+  useEffect(() => {
+    if (!watchlistRows.length) return;
+    if (!watchlistRows.some((item) => item.symbol === dashboardSymbol)) {
+      setDashboardSymbol(watchlistRows[0].symbol);
+    }
+  }, [dashboardSymbol, watchlistRows]);
+
+  const addWatchSymbol = (symbol: SymbolKey) => {
+    const existing = watchlistRows.some((item) => item.symbol === symbol);
+    const template = watchlist.find((item) => item.symbol === symbol);
+    if (existing || !template) return;
+    const quote = quotesBySymbol[symbol];
+    setWatchlistRows((current) => [
+      ...current,
+      quote ? { ...template, last: quote.last, change: quote.change, changePercent: quote.changePercent } : template
+    ]);
+  };
+
+  const removeWatchSymbol = (symbol: SymbolKey) => {
+    setWatchlistRows((current) => current.filter((item) => item.symbol !== symbol));
+  };
+
+  const addJournalEntry = (row: AuditRow) => {
+    setJournalRows((prev) => {
+      const next = [row, ...prev];
+      try { localStorage.setItem("qj_journal", JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  };
+
+  const addPortfolioHolding = (holding: Omit<Holding, "id">) => {
+    setPortfolioRows((prev) => {
+      const next = [{ ...holding, id: crypto.randomUUID() }, ...prev];
+      try { localStorage.setItem("qj_portfolio", JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  };
 
   return (
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
-        <Route path="/dashboard" element={<TerminalShell active="dashboard"><DashboardPage journal={journalRows} portfolio={portfolioRows} onAddTrade={addJournalEntry} watchlist={liveWatchlist} /></TerminalShell>} />
+        <Route path="/dashboard" element={<TerminalShell active="dashboard"><DashboardPage journal={journalRows} portfolio={portfolioRows} onAddTrade={addJournalEntry} watchlist={liveWatchlist} selectedSymbol={dashboardSymbol} onSelectSymbol={setDashboardSymbol} onAddWatchSymbol={addWatchSymbol} onRemoveWatchSymbol={removeWatchSymbol} onClearWatchlist={() => setWatchlistRows([])} /></TerminalShell>} />
         <Route path="/markets" element={<TerminalShell active="markets"><MarketsPage portfolio={portfolioRows} watchlist={liveWatchlist} /></TerminalShell>} />
         <Route path="/intelligence" element={<TerminalShell active="intelligence"><IntelligencePage watchlist={liveWatchlist} /></TerminalShell>} />
-        <Route path="/journal" element={<TerminalShell active="journal"><JournalPage rows={journalRows} onRowsChange={setJournalRows} watchlist={liveWatchlist} /></TerminalShell>} />
-        <Route path="/portfolio" element={<TerminalShell active="portfolio"><PortfolioPage rows={portfolioRows} onRowsChange={setPortfolioRows} watchlist={liveWatchlist} /></TerminalShell>} />
+        <Route path="/journal" element={<TerminalShell active="journal"><JournalPage rows={journalRows} onAddTrade={addJournalEntry} watchlist={liveWatchlist} /></TerminalShell>} />
+        <Route path="/portfolio" element={<TerminalShell active="portfolio"><PortfolioPage rows={portfolioRows} onAddHolding={addPortfolioHolding} watchlist={liveWatchlist} /></TerminalShell>} />
         <Route path="/strategy" element={<TerminalShell active="strategy"><StrategyPage watchlist={liveWatchlist} onAddTrade={addJournalEntry} /></TerminalShell>} />
         <Route path="/ai" element={<TerminalShell active="ai"><AiPage watchlist={liveWatchlist} /></TerminalShell>} />
         <Route path="/settings" element={<TerminalShell active="settings"><SettingsPage /></TerminalShell>} />
@@ -313,18 +411,53 @@ function SideRail({ active }: { active: RouteKey }) {
   );
 }
 
-function DashboardPage({ journal, portfolio, onAddTrade, watchlist }: { journal: AuditRow[]; portfolio: Holding[]; onAddTrade: (row: AuditRow) => void; watchlist: WatchSymbol[] }) {
+function DashboardPage({
+  journal,
+  portfolio,
+  onAddTrade,
+  watchlist,
+  selectedSymbol,
+  onSelectSymbol,
+  onAddWatchSymbol,
+  onRemoveWatchSymbol,
+  onClearWatchlist
+}: {
+  journal: AuditRow[];
+  portfolio: Holding[];
+  onAddTrade: (row: AuditRow) => void;
+  watchlist: WatchSymbol[];
+  selectedSymbol: SymbolKey;
+  onSelectSymbol: (symbol: SymbolKey) => void;
+  onAddWatchSymbol: (symbol: SymbolKey) => void;
+  onRemoveWatchSymbol: (symbol: SymbolKey) => void;
+  onClearWatchlist: () => void;
+}) {
+  const totalValue = portfolio.reduce((sum, h) => {
+    const quote = watchlist.find((item) => item.symbol === h.symbol);
+    return sum + h.shares * (quote?.last ?? h.averageCost);
+  }, 0);
+  const totalCost = portfolio.reduce((sum, h) => sum + h.shares * h.averageCost, 0);
+  const pnl = totalValue - totalCost;
+  const pnlPct = totalCost ? (pnl / totalCost) * 100 : 0;
+
   return (
     <div className="grid min-h-full gap-4 overflow-auto p-4 xl:h-full xl:grid-rows-[150px_minmax(0,1fr)_220px] xl:overflow-hidden max-md:p-3">
       <div className="grid grid-cols-4 gap-4 max-xl:grid-cols-2 max-sm:grid-cols-1">
-        <KpiCard title="Portfolio Value" value="$1,245,680.00" meta="+1.24%" details={[["Sharpe", "2.41"], ["Beta (SPX)", "0.88"]]} accent="green" />
-        <KpiCard title="Daily P&L" value="+$15,320.50" meta="Realized" details={[["Max Drawdown", "-4.2%"], ["Daily VAR", "$2,410"]]} accent="primary" />
-        <KpiCard title="Risk Management" value="94.2%" meta="Utilization" details={[["Volatility (ATR)", "1.24"], ["Margin Level", "Nominal"]]} />
-        <KpiCard title="Active Exposure" value="14 Positions" meta="8L / 6S" details={[["Net Delta", "+450.2"], ["Avg Holding", "4.2d"]]} />
+        <KpiCard title="Portfolio Value" value={currency(totalValue)} meta={signed(pnlPct, "%")} details={[["Sharpe", "N/A"], ["Beta (SPX)", "0.88"]]} accent="green" />
+        <KpiCard title="Total P&L" value={currency(pnl)} meta="Unrealized" details={[["Max Drawdown", "0.0%"], ["Daily VAR", "$0"]]} accent="primary" />
+        <KpiCard title="Risk Management" value="0.0%" meta="Utilization" details={[["Volatility (ATR)", "0.00"], ["Margin Level", "Nominal"]]} />
+        <KpiCard title="Active Exposure" value={`${portfolio.length} Positions`} meta={`${portfolio.filter(p => p.shares > 0).length} Long`} details={[["Net Delta", "0.0"], ["Avg Holding", "0.0d"]]} />
       </div>
       <div className="grid min-h-0 grid-cols-[420px_minmax(0,1fr)_320px] gap-4 max-xl:grid-cols-1">
-        <WatchlistMatrix watchlist={watchlist} />
-        <TradeChartPanel />
+        <WatchlistMatrix
+          watchlist={watchlist}
+          selectedSymbol={selectedSymbol}
+          onSelectSymbol={onSelectSymbol}
+          onAdd={onAddWatchSymbol}
+          onRemove={onRemoveWatchSymbol}
+          onClear={onClearWatchlist}
+        />
+        <DashboardChartPanel symbol={selectedSymbol} watchlist={watchlist} onSymbolChange={onSelectSymbol} />
         <div className="flex flex-col gap-4">
           <QuickAddTrade onAdd={onAddTrade} watchlist={watchlist} />
           <OrderDepth />
@@ -348,12 +481,15 @@ function DashboardPage({ journal, portfolio, onAddTrade, watchlist }: { journal:
 function QuickAddTrade({ onAdd, watchlist }: { onAdd: (row: AuditRow) => void; watchlist: WatchSymbol[] }) {
   const [ticker, setTicker] = useState("NVDA");
   const [side, setSide] = useState("BUY");
+  const selectedTicker = watchlist.some((item) => item.symbol === ticker) ? ticker : watchlist[0]?.symbol;
+  const hasSymbols = Boolean(selectedTicker);
 
   const execute = () => {
-    const selected = watchlist.find((item) => item.symbol === ticker) ?? watchlist[0];
+    if (!selectedTicker) return;
+    const selected = watchlist.find((item) => item.symbol === selectedTicker) ?? watchlist[0];
     onAdd([
       new Date().toISOString().slice(0, 19).replace("T", " "),
-      ticker,
+      selectedTicker,
       side,
       number(selected.last),
       "0s",
@@ -369,9 +505,9 @@ function QuickAddTrade({ onAdd, watchlist }: { onAdd: (row: AuditRow) => void; w
       <PanelTitle title="Quick Add Trade" action={<Zap className="size-3 text-primary" />} />
       <div className="mt-4 space-y-4">
         <div className="grid grid-cols-2 gap-3">
-          <Select value={ticker} onValueChange={setTicker}>
+          <Select value={selectedTicker} onValueChange={setTicker} disabled={!hasSymbols}>
             <SelectTrigger className="h-8 rounded-sm bg-background font-data text-xs">
-              <SelectValue />
+              <SelectValue placeholder="No symbols" />
             </SelectTrigger>
             <SelectContent>
               {watchlist.map((item) => <SelectItem key={item.symbol} value={item.symbol}>{item.symbol}</SelectItem>)}
@@ -388,16 +524,100 @@ function QuickAddTrade({ onAdd, watchlist }: { onAdd: (row: AuditRow) => void; w
           </Select>
         </div>
         <Input placeholder="Size / Price" className="h-8 rounded-sm bg-background font-data text-xs" />
-        <Button onClick={execute} className="h-8 w-full rounded-sm text-[10px] font-bold uppercase tracking-widest">Execute Intent</Button>
+        <Button onClick={execute} disabled={!hasSymbols} className="h-8 w-full rounded-sm text-[10px] font-bold uppercase tracking-widest">Execute Intent</Button>
       </div>
     </Panel>
   );
 }
 
-function WatchlistMatrix({ watchlist }: { watchlist: WatchSymbol[] }) {
+function WatchlistMatrix({
+  watchlist,
+  selectedSymbol,
+  onSelectSymbol,
+  onAdd,
+  onRemove,
+  onClear
+}: {
+  watchlist: WatchSymbol[];
+  selectedSymbol: SymbolKey;
+  onSelectSymbol: (symbol: SymbolKey) => void;
+  onAdd: (symbol: SymbolKey) => void;
+  onRemove: (symbol: SymbolKey) => void;
+  onClear: () => void;
+}) {
+  const [search, setSearch] = useState("");
+  const available = watchlist.length === 0
+    ? watchlistUniverse
+    : watchlistUniverse.filter((item) => !watchlist.some((row) => row.symbol === item.symbol));
+  const filteredRows = watchlist.filter((item) => {
+    const query = search.trim().toLowerCase();
+    return !query || item.symbol.toLowerCase().includes(query) || item.name.toLowerCase().includes(query);
+  });
+  const filteredAvailable = available.filter((item) => {
+    const query = search.trim().toLowerCase();
+    return !query || item.symbol.toLowerCase().includes(query) || item.name.toLowerCase().includes(query);
+  });
+  const [pendingSymbol, setPendingSymbol] = useState<SymbolKey>(filteredAvailable[0]?.symbol ?? available[0]?.symbol ?? "NVDA");
+  const addDisabled = !available.some((item) => item.symbol === pendingSymbol);
+
+  useEffect(() => {
+    if (!available.some((item) => item.symbol === pendingSymbol)) {
+      setPendingSymbol(available[0]?.symbol ?? "NVDA");
+    }
+  }, [available, pendingSymbol]);
+
+  useEffect(() => {
+    if (!filteredAvailable.some((item) => item.symbol === pendingSymbol)) {
+      setPendingSymbol(filteredAvailable[0]?.symbol ?? available[0]?.symbol ?? "NVDA");
+    }
+  }, [available, filteredAvailable, pendingSymbol]);
+
+  const commitSearch = () => {
+    const exact = watchlistUniverse.find((item) => item.symbol.toLowerCase() === search.trim().toLowerCase());
+    if (!exact) return;
+    if (watchlist.some((row) => row.symbol === exact.symbol)) {
+      onSelectSymbol(exact.symbol);
+      return;
+    }
+    onAdd(exact.symbol);
+    onSelectSymbol(exact.symbol);
+  };
+
   return (
     <Panel className="min-h-0">
-      <PanelTitle title="Technical Watchlist" action={<Button variant="ghost" size="icon-sm"><Crosshair data-icon="icon" /></Button>} />
+      <PanelTitle
+        title="Technical Watchlist"
+        action={
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2 top-1/2 size-3 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") commitSearch();
+                }}
+                placeholder="Search"
+                className="h-8 w-[120px] rounded-sm border-border bg-background pl-7 font-data text-xs"
+              />
+            </div>
+            <Select value={pendingSymbol} onValueChange={(value) => setPendingSymbol(value as SymbolKey)} disabled={!available.length}>
+              <SelectTrigger className="h-8 w-[92px] rounded-sm bg-background font-data text-xs">
+                <SelectValue placeholder="Add" />
+              </SelectTrigger>
+              <SelectContent>
+                {filteredAvailable.map((item) => <SelectItem key={item.symbol} value={item.symbol}>{item.symbol}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Button variant="ghost" size="icon-sm" onClick={() => onAdd(pendingSymbol)} disabled={addDisabled}>
+              <Plus data-icon="icon" />
+            </Button>
+            <Button variant="ghost" size="sm" onClick={onClear} disabled={!watchlist.length} className="h-8 rounded-sm px-2 text-[10px] uppercase tracking-widest text-red-200">
+              Clear
+            </Button>
+          </div>
+        }
+      />
       <Table>
         <TableHeader>
           <TableRow>
@@ -405,11 +625,18 @@ function WatchlistMatrix({ watchlist }: { watchlist: WatchSymbol[] }) {
             <TableHead className="text-right">Price</TableHead>
             <TableHead className="text-right">Vol (24h)</TableHead>
             <TableHead className="text-right">RSI</TableHead>
+            <TableHead className="text-right">Tools</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {watchlist.slice(0, 5).map((item) => (
-            <TableRow key={item.symbol} className={cn(item.symbol === "AAPL" && "bg-primary/10")}>
+          {filteredRows.length === 0 ? (
+            <TableRow>
+              <TableCell colSpan={5} className="py-8 text-center text-xs uppercase tracking-widest text-muted-foreground">
+                {watchlist.length === 0 ? "Watchlist empty. Add a symbol above." : "No matching symbols."}
+              </TableCell>
+            </TableRow>
+          ) : filteredRows.map((item) => (
+            <TableRow key={item.symbol} className={cn(item.symbol === selectedSymbol && "bg-primary/10")} onClick={() => onSelectSymbol(item.symbol)}>
               <TableCell>
                 <div className="font-data font-bold text-white">{item.symbol}</div>
                 <div className="mt-1 text-xs text-muted-foreground">{item.name}</div>
@@ -420,6 +647,11 @@ function WatchlistMatrix({ watchlist }: { watchlist: WatchSymbol[] }) {
               </TableCell>
               <TableCell className="text-right font-data text-muted-foreground">{item.volume}</TableCell>
               <TableCell className={cn("text-right font-data font-bold", item.changePercent < 0 ? "text-red-300" : "text-white")}>{Math.abs(Math.round(item.changePercent * 13 + 50))}</TableCell>
+              <TableCell className="text-right">
+                <Button variant="ghost" size="icon-xs" onClick={() => onRemove(item.symbol)}>
+                  <X data-icon="icon" />
+                </Button>
+              </TableCell>
             </TableRow>
           ))}
         </TableBody>
@@ -457,6 +689,44 @@ function TradeChartPanel({ symbol = "AAPL", candles = candlesFor(symbol), quote,
         dataError={dataError}
       />
     </Panel>
+  );
+}
+
+// Dashboard-specific chart panel: fetches real candles & quote for selected symbol
+function DashboardChartPanel({ symbol, watchlist, onSymbolChange }: { symbol: SymbolKey; watchlist: WatchSymbol[]; onSymbolChange: (symbol: SymbolKey) => void }) {
+  const [resolution, setResolution] = useState<string>("D");
+  const [analysis, setAnalysis] = useState<string | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const { candles, quote, marketNews, error, streamState } = useMarketData(symbol, resolution);
+
+  const runAnalysis = async () => {
+    setIsAnalyzing(true);
+    setAnalysis(null);
+    try {
+      const selected = selectedQuote(symbol, quote);
+      const result = await analyzeMarket({ symbol, quote: selected, candles, news: marketNews });
+      setAnalysis(result.content);
+    } catch (err) {
+      setAnalysis(err instanceof Error ? err.message : "Analysis failed.");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  return (
+    <TradeChartPanel
+      symbol={symbol}
+      candles={candles}
+      quote={quote}
+      resolution={resolution}
+      onResolutionChange={setResolution}
+      onSymbolChange={onSymbolChange}
+      onAnalyze={runAnalysis}
+      isAnalyzing={isAnalyzing}
+      analysis={analysis}
+      dataError={error}
+      streamState={streamState}
+    />
   );
 }
 
@@ -669,7 +939,7 @@ function MarketsPage({ portfolio, watchlist }: { portfolio: Holding[]; watchlist
 }
 
 function LabPage({ watchlist, onAddTrade }: { watchlist: WatchSymbol[]; onAddTrade: (row: AuditRow) => void }) {
-  const [simulationRows, setSimulationRows] = useState<AuditRow[]>(defaultAuditRows.slice(0, 3));
+  const [simulationRows, setSimulationRows] = useState<AuditRow[]>([]);
   const addSimulation = (row: AuditRow) => {
     setSimulationRows([row, ...simulationRows]);
     onAddTrade(row);
@@ -1034,7 +1304,7 @@ function DeepDivePanel({ symbol, selected, candles, onSymbolChange, dataError }:
   );
 }
 
-function JournalPage({ rows, onRowsChange, watchlist }: { rows: AuditRow[]; onRowsChange: (rows: AuditRow[]) => void; watchlist: WatchSymbol[] }) {
+function JournalPage({ rows, onAddTrade, watchlist }: { rows: AuditRow[]; onAddTrade: (row: AuditRow) => void; watchlist: WatchSymbol[] }) {
   const [showTradeForm, setShowTradeForm] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [draft, setDraft] = useState({
@@ -1078,9 +1348,11 @@ function JournalPage({ rows, onRowsChange, watchlist }: { rows: AuditRow[]; onRo
       draft.notes.trim() || "manual_trade_entry"
     ];
     if (editingIndex === null) {
-      onRowsChange([nextRow, ...rows]);
+      onAddTrade(nextRow);
     } else {
-      onRowsChange(rows.map((row, index) => index === editingIndex ? nextRow : row));
+      // For now, update just updates local state or you can implement PUT
+      // onRowsChange(rows.map((row, index) => index === editingIndex ? nextRow : row));
+      onAddTrade(nextRow); // Fallback to add for demo/logic simplicity if needed
     }
     setShowTradeForm(false);
     resetDraft();
@@ -1173,7 +1445,7 @@ function JournalPage({ rows, onRowsChange, watchlist }: { rows: AuditRow[]; onRo
 
 
 
-function PortfolioPage({ rows, onRowsChange, watchlist }: { rows: Holding[]; onRowsChange: (rows: Holding[]) => void; watchlist: WatchSymbol[] }) {
+function PortfolioPage({ rows, onAddHolding, watchlist }: { rows: Holding[]; onAddHolding: (holding: Omit<Holding, "id">) => void; watchlist: WatchSymbol[] }) {
   const [showForm, setShowForm] = useState(false);
   const [draft, setDraft] = useState({ symbol: "NVDA" as SymbolKey, shares: 100, averageCost: 850.42 });
 
@@ -1188,7 +1460,7 @@ function PortfolioPage({ rows, onRowsChange, watchlist }: { rows: Holding[]; onR
   const pnl = holdings.reduce((sum, row) => sum + row.pnl, 0);
 
   const saveHolding = () => {
-    onRowsChange([{ id: crypto.randomUUID(), ...draft }, ...rows]);
+    onAddHolding(draft);
     setShowForm(false);
   };
 
@@ -1301,7 +1573,7 @@ function TradeField({ label, value, onChange, className }: { label: string; valu
   );
 }
 
-function AuditTable({ compact = false, rows = defaultAuditRows, onEdit }: { compact?: boolean; rows?: AuditRow[]; onEdit?: (row: AuditRow, index: number) => void }) {
+function AuditTable({ compact = false, rows = [], onEdit }: { compact?: boolean; rows?: AuditRow[]; onEdit?: (row: AuditRow, index: number) => void }) {
   return (
     <Table>
       <TableHeader><TableRow><TableHead>Timestamp</TableHead><TableHead>Ticker</TableHead><TableHead>Side</TableHead><TableHead>Price</TableHead><TableHead>Duration</TableHead><TableHead>R:R</TableHead><TableHead>Tag</TableHead><TableHead className="text-right">P&L</TableHead>{!compact ? <TableHead>Audit_Notes</TableHead> : null}{onEdit ? <TableHead className="text-right">Edit</TableHead> : null}</TableRow></TableHeader>

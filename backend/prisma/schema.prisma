@@ -1,0 +1,46 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model JournalEntry {
+  id        String   @id @default(uuid())
+  timestamp String
+  ticker    String
+  side      String
+  price     String
+  duration  String
+  rr        String
+  tag       String
+  pnl       String
+  notes     String
+  createdAt DateTime @default(now())
+}
+
+model Holding {
+  id          String   @id @default(uuid())
+  symbol      String
+  shares      Float
+  averageCost Float
+  createdAt   DateTime @default(now())
+}
+
+model Strategy {
+  id          String   @id @default(uuid())
+  name        String
+  timeframe   String
+  entry       String
+  exit        String
+  riskPercent Float
+  status      String   @default("active")
+  createdAt   DateTime @default(now())
+}
+
+model SharedPortfolio {
+  id        String   @id @default(uuid())
+  snapshot  Json
+  createdAt DateTime @default(now())
+}

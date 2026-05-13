@@ -4,15 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "node --env-file-if-exists=../.env --experimental-sqlite index.js",
-    "start": "node --env-file-if-exists=../.env --experimental-sqlite index.js"
+    "dev": "node --env-file-if-exists=../.env index.js",
+    "start": "node --env-file-if-exists=../.env index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^5.2.1"
-  },
-  "devDependencies": {
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6"
   }
 }

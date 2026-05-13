@@ -52,6 +52,7 @@ export function TechnicalChart({
   streamState,
   dataError
 }: TechnicalChartProps) {
+  const isRateLimited = dataError?.includes("429");
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [drawMode, setDrawMode] = useState<DrawMode>("none");
@@ -308,7 +309,7 @@ export function TechnicalChart({
         <div className="flex shrink-0 items-center gap-3 text-xs">
           <span className={cn("font-data", streamState === "subscribed" ? "text-emerald-400" : dataError ? "text-amber-300" : "text-muted-foreground")}>
             <span className={cn("mr-1 inline-block size-1.5 rounded-full", streamState === "subscribed" ? "bg-emerald-500" : dataError ? "bg-amber-300" : "bg-muted-foreground")} />
-            {streamState === "subscribed" ? "Massive Stream" : dataError ? "Candle Fallback" : "Massive REST"}
+            {streamState === "subscribed" ? "Massive Stream" : isRateLimited ? "Massive Rate Limited" : dataError ? "Candle Fallback" : "Massive REST"}
           </span>
           {onAnalyze ? (
             <Button variant="outline" size="sm" onClick={onAnalyze} disabled={isAnalyzing}>
