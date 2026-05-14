@@ -8,7 +8,16 @@
     "start": "node --env-file-if-exists=../.env index.js"
   },
   "dependencies": {
+    "@prisma/adapter-better-sqlite3": "^7.8.0",
+    "@prisma/client": "^7.8.0",
+    "@xenova/transformers": "^2.17.2",
+    "better-sqlite3": "^12.10.0",
     "cors": "^2.8.5",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "google-it": "^1.6.4",
+    "vectra": "^0.14.0"
+  },
+  "devDependencies": {
+    "prisma": "^7.8.0"
   }
 }

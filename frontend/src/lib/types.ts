@@ -62,6 +62,13 @@ export type Holding = {
   symbol: SymbolKey;
   shares: number;
   averageCost: number;
+  thesis?: string;
+  conviction?: "watch" | "starter" | "core" | "high";
+  timeHorizon?: "trade" | "swing" | "long-term";
+  buyMoreAt?: number;
+  trimAt?: number;
+  invalidation?: string;
+  riskNotes?: string;
 };
 
 export type ChatMessage = {

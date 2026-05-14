@@ -6,6 +6,7 @@ import {
   BarChart3,
   Bell,
   Bot,
+  Brain,
   Camera,
   ChartNoAxesCombined,
   CheckCircle2,
@@ -18,11 +19,15 @@ import {
   Filter,
   Gauge,
   Grid2X2,
+  History,
   Layers,
   LineChart,
   Maximize2,
+  MessageSquare,
   PanelTop,
   Plus,
+  Paperclip,
+  Pin,
   Search,
   Send,
   Settings,
@@ -30,12 +35,16 @@ import {
   SlidersHorizontal,
   SquareTerminal,
   Target,
+  Trash2,
   WalletCards,
   X,
-  Zap
+  Zap,
+  Globe,
+  TrendingUp
 } from "lucide-react";
-import { candlesFor, news as mockNews, watchlist } from "@/data/mock";
-import { analyzeMarket, chatAboutMarket } from "@/lib/ai";
+import { candlesFor, news as fallbackNews, watchlist } from "@/data/mock";
+import { analyzeMarket, chatAboutMarket, createContextAttachment, createMemory, deleteMemory, deletePortfolioItem as deletePortItem, fetchMemories, fetchPortfolio, savePortfolioItem as savePortItem, updateMemory, fetchJournal, saveJournalEntry as saveJournal, deleteJournalEntry, type MemoryItem, type JournalEntry } from "@/lib/ai";
+import { fetchSession, login, logout, type AuthSession } from "@/lib/auth";
 import { currency, number, signed } from "@/lib/format";
 import { getMarketCandles, getMarketNews, getQuote, marketStreamUrl, type MarketQuote } from "@/lib/market";
 import { TechnicalChart } from "@/components/technical-chart";
@@ -43,12 +52,14 @@ import type { Candle, Holding, NewsItem, SymbolKey, WatchSymbol } from "@/lib/ty
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
@@ -59,21 +70,21 @@ const routes: Array<{ key: RouteKey; label: string; short: string; to: string; i
   { key: "markets", label: "Chart", short: "Chart", to: "/markets", icon: LineChart },
   { key: "strategy", label: "Lab", short: "Lab", to: "/strategy", icon: ChartNoAxesCombined },
   { key: "journal", label: "Orders", short: "Orders", to: "/journal", icon: PanelTop },
-  { key: "portfolio", label: "Portfolio", short: "Wallet", to: "/portfolio", icon: WalletCards },
+  { key: "portfolio", label: "Portfolio", short: "Port", to: "/portfolio", icon: WalletCards },
   { key: "intelligence", label: "Markets", short: "Mkts", to: "/intelligence", icon: Activity },
   { key: "ai", label: "Chat", short: "Chat", to: "/ai", icon: Bot },
   { key: "settings", label: "Settings", short: "Set", to: "/settings", icon: Settings }
 ];
 
-type AuditRow = [timestamp: string, ticker: string, side: string, price: string, duration: string, rr: string, tag: string, pnl: string, notes: string];
+type AuditRow = [timestamp: string, ticker: string, side: string, price: string, duration: string, rr: string, tag: string, pnl: string, notes: string, id?: string];
 
-const defaultAuditRows: AuditRow[] = [
-  ["2023.10.24 09:30:11", "NVDA", "BUY", "432.15", "12m 44s", "2.4", "#EMA-CROSS", "+$450.00", "breakout_confirmation_confirmed; vol_spike_detected"],
-  ["2023.10.24 10:15:45", "TSLA", "SELL", "212.50", "04m 12s", "1.2", "#VWAP-REJECT", "-$120.00", "failed_breakdown; exit_early_trigger"],
-  ["2023.10.24 11:45:02", "AAPL", "BUY", "173.20", "45m 18s", "4.1", "#TREND-FOLLOW", "+$890.50", "riding_vwap_trend; no_exit_signals_triggered"],
-  ["2023.10.24 13:20:30", "MSFT", "BUY", "330.10", "08m 05s", "0.0", "#SCRATCH", "$0.00", "market_chop_detected; exit_break_even"],
-  ["2023.10.23 15:45:19", "SPY", "SELL", "421.80", "1h 05m", "3.5", "#EOD-FADE", "+$1,200.00", "setup_perfect_execution; high_confidence_fade"]
-];
+function toAuditRow(entry: JournalEntry): AuditRow {
+  return [entry.timestamp, entry.ticker, entry.side, entry.price, entry.duration, entry.rr, entry.tag, entry.pnl, entry.notes, entry.id];
+}
+
+function fromAuditRow(row: AuditRow): Partial<JournalEntry> {
+  return { id: row[9], timestamp: row[0], ticker: row[1], side: row[2], price: row[3], duration: row[4], rr: row[5], tag: row[6], pnl: row[7], notes: row[8] };
+}
 
 const intelItems = [
   {
@@ -104,15 +115,26 @@ type ChatUiMessage = {
   id: string;
   type: "system" | "operator" | "analysis";
   text: string;
+  activity?: string[];
+  sources?: "web" | "local";
+  memorySaved?: string[];
 };
 
-const intervals = ["1", "5", "15", "60", "D"] as const;
+type ChatThread = {
+  id: string;
+  title: string;
+  symbol: SymbolKey;
+  messages: ChatUiMessage[];
+  lastActive: number;
+};
+
+const timeframes = ["1m", "5m", "15m", "1H", "D", "1M", "1Y", "5Y", "MAX"] as const;
 
 function useMarketData(symbol: SymbolKey, resolution = "D") {
   const fallback = useMemo(() => candlesFor(symbol), [symbol]);
   const [candles, setCandles] = useState<Candle[]>(fallback);
   const [quote, setQuote] = useState<MarketQuote | null>(null);
-  const [marketNews, setMarketNews] = useState<NewsItem[]>(mockNews.filter((item) => item.symbol === symbol || item.symbol === "MARKET"));
+  const [marketNews, setMarketNews] = useState<NewsItem[]>(fallbackNews.filter((item) => item.symbol === symbol || item.symbol === "MARKET"));
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [streamState, setStreamState] = useState<"idle" | "connecting" | "subscribed" | "closed" | "error">("idle");
@@ -139,7 +161,7 @@ function useMarketData(symbol: SymbolKey, resolution = "D") {
   useEffect(() => {
     let active = true;
     setCandles(fallback);
-    setMarketNews(mockNews.filter((item) => item.symbol === symbol || item.symbol === "MARKET"));
+    setMarketNews(fallbackNews.filter((item) => item.symbol === symbol || item.symbol === "MARKET"));
     setQuote(null);
     Promise.allSettled([getQuote(symbol), getMarketNews(symbol)]).then((results) => {
       if (!active) return;
@@ -207,26 +229,156 @@ function selectedQuote(symbol: SymbolKey, quote: MarketQuote | null): WatchSymbo
 const stockSymbolsForLive = new Set<SymbolKey>(["NVDA", "AAPL", "TSLA", "MSFT", "AMD"]);
 const watchlistUniverse = watchlist;
 
+function AuthLoadingScreen() {
+  return (
+    <div className="flex h-dvh items-center justify-center bg-background text-foreground">
+      <div className="font-data text-xs uppercase tracking-[0.3em] text-muted-foreground">Checking session</div>
+    </div>
+  );
+}
+
+function LoginScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const submit = () => {
+    if (isSubmitting) return;
+    setError(null);
+    setIsSubmitting(true);
+    login(username.trim(), password).then((result) => {
+      onAuthenticated({ authenticated: true, username: result.username });
+    }).catch((err) => {
+      setError(err instanceof Error ? err.message : "Login failed");
+    }).finally(() => setIsSubmitting(false));
+  };
+
+  return (
+    <div className="flex h-dvh items-center justify-center bg-background p-4 text-foreground">
+      <div className="w-full max-w-sm border border-border bg-card p-5 shadow-2xl">
+        <div className="mb-6">
+          <div className="font-data text-xs font-bold uppercase tracking-[0.35em] text-primary">QuantCore</div>
+          <h1 className="mt-3 text-2xl font-black text-white">Secure Login</h1>
+          <p className="mt-2 text-sm text-muted-foreground">Enter the production operator credentials.</p>
+        </div>
+        <div className="flex flex-col gap-3">
+          <Input
+            autoComplete="username"
+            className="h-11 rounded-sm border-border bg-background font-data"
+            placeholder="Login ID"
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && submit()}
+          />
+          <Input
+            autoComplete="current-password"
+            className="h-11 rounded-sm border-border bg-background font-data"
+            placeholder="Password"
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && submit()}
+          />
+          {error ? <div className="border border-destructive/30 bg-destructive/10 p-3 text-xs text-red-200">{error}</div> : null}
+          <Button className="h-11 rounded-sm font-bold uppercase tracking-[0.18em]" onClick={submit} disabled={isSubmitting || !username.trim() || !password}>
+            {isSubmitting ? "Signing In" : "Enter Terminal"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  const [session, setSession] = useState<AuthSession | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  useEffect(() => {
+    fetchSession().then((current) => {
+      setSession(current);
+      setAuthReady(true);
+    });
+    const expire = () => setSession(null);
+    window.addEventListener("qj-auth-expired", expire);
+    return () => window.removeEventListener("qj-auth-expired", expire);
+  }, []);
+
+  if (!authReady) {
+    return <AuthLoadingScreen />;
+  }
+
+  if (!session) {
+    return <LoginScreen onAuthenticated={(nextSession) => setSession(nextSession)} />;
+  }
+
+  return <AuthenticatedApp onLogout={() => setSession(null)} />;
+}
+
+function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
   const [journalRows, setJournalRows] = useState<AuditRow[]>([]);
   const [portfolioRows, setPortfolioRows] = useState<Holding[]>([]);
   const [watchlistRows, setWatchlistRows] = useState<WatchSymbol[]>(watchlist);
   const [quotesBySymbol, setQuotesBySymbol] = useState<Partial<Record<SymbolKey, MarketQuote>>>({});
-  const [simTick, setSimTick] = useState(0);
   const [dashboardSymbol, setDashboardSymbol] = useState<SymbolKey>(watchlist[0].symbol);
+  const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
 
-  // Persist journal + portfolio in localStorage (no DB required)
+  // Sync AI thread with Dashboard symbol if needed
+  useEffect(() => {
+    if (activeThreadId) {
+      const active = chatThreads.find(t => t.id === activeThreadId);
+      if (active && active.symbol !== dashboardSymbol) {
+        setDashboardSymbol(active.symbol);
+      }
+    }
+  }, [activeThreadId]);
+
+  const handleGlobalSymbolChange = (s: SymbolKey) => {
+    setDashboardSymbol(s);
+    // Also find or create AI thread for this symbol
+    const existing = chatThreads.find(t => t.symbol === s);
+    if (existing) {
+      setActiveThreadId(existing.id);
+    } else setActiveThreadId(`new-${s}-${Date.now()}`);
+  };
+
   useEffect(() => {
     try {
-      const saved = localStorage.getItem("qj_journal");
-      if (saved) setJournalRows(JSON.parse(saved));
+      const saved = localStorage.getItem("qj_chat_threads");
+      const parsed = saved ? JSON.parse(saved) as ChatThread[] : [];
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        setChatThreads(parsed);
+        setActiveThreadId(parsed[0].id);
+      }
     } catch { /* ignore */ }
   }, []);
+
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem("qj_portfolio");
-      if (saved) setPortfolioRows(JSON.parse(saved));
-    } catch { /* ignore */ }
+    if (chatThreads.length > 0) {
+      localStorage.setItem("qj_chat_threads", JSON.stringify(chatThreads));
+    }
+  }, [chatThreads]);
+  useEffect(() => {
+    fetchJournal().then(entries => {
+      setJournalRows(entries.map(toAuditRow));
+    }).catch(() => {
+      try {
+        const saved = localStorage.getItem("qj_journal");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed)) setJournalRows(parsed);
+        }
+      } catch { /* ignore */ }
+    });
+  }, []);
+  useEffect(() => {
+    fetchPortfolio().then(setPortfolioRows).catch(() => {
+      try {
+        const saved = localStorage.getItem("qj_portfolio");
+        if (saved) setPortfolioRows(JSON.parse(saved));
+      } catch { /* ignore */ }
+    });
   }, []);
 
   useEffect(() => {
@@ -250,12 +402,6 @@ export default function App() {
     return () => clearInterval(timer);
   }, [watchlistRows]);
 
-  // Keep non-API symbols moving slightly so crypto/FX mock rows don't look frozen.
-  useEffect(() => {
-    const timer = setInterval(() => setSimTick((s) => s + 1), 5000);
-    return () => clearInterval(timer);
-  }, []);
-
   const liveWatchlist = useMemo(() => {
     return watchlistRows.map((item) => {
       const quote = quotesBySymbol[item.symbol];
@@ -267,16 +413,9 @@ export default function App() {
           changePercent: quote.changePercent
         };
       }
-      const drift = (Math.sin(simTick + item.symbol.length) * 0.05);
-      const newLast = item.last + drift;
-      return {
-        ...item,
-        last: newLast,
-        change: item.change + drift,
-        changePercent: item.changePercent + (drift / item.last) * 100
-      };
+      return item;
     });
-  }, [quotesBySymbol, simTick, watchlistRows]);
+  }, [quotesBySymbol, watchlistRows]);
 
   useEffect(() => {
     if (!watchlistRows.length) return;
@@ -301,81 +440,198 @@ export default function App() {
   };
 
   const addJournalEntry = (row: AuditRow) => {
-    setJournalRows((prev) => {
-      const next = [row, ...prev];
-      try { localStorage.setItem("qj_journal", JSON.stringify(next)); } catch { /* ignore */ }
-      return next;
-    });
+    saveJournal(fromAuditRow(row)).then((saved) => {
+      setJournalRows((prev) => {
+        const next = [toAuditRow(saved), ...prev];
+        try { localStorage.setItem("qj_journal", JSON.stringify(next)); } catch { /* ignore */ }
+        return next;
+      });
+    }).catch(console.error);
+  };
+
+  const updateJournalEntry = (index: number, row: AuditRow) => {
+    saveJournal(fromAuditRow(row)).then((saved) => {
+      setJournalRows((prev) => {
+        const next = prev.map((current, currentIndex) => currentIndex === index ? toAuditRow(saved) : current);
+        try { localStorage.setItem("qj_journal", JSON.stringify(next)); } catch { /* ignore */ }
+        return next;
+      });
+    }).catch(console.error);
   };
 
   const addPortfolioHolding = (holding: Omit<Holding, "id">) => {
-    setPortfolioRows((prev) => {
-      const next = [{ ...holding, id: crypto.randomUUID() }, ...prev];
-      try { localStorage.setItem("qj_portfolio", JSON.stringify(next)); } catch { /* ignore */ }
-      return next;
-    });
+    savePortItem(holding).then((saved) => {
+      setPortfolioRows((prev) => {
+        const next = [saved, ...prev];
+        try { localStorage.setItem("qj_portfolio", JSON.stringify(next)); } catch { /* ignore */ }
+        return next;
+      });
+    }).catch(console.error);
+  };
+
+  const updatePortfolioHolding = (id: string, patch: Partial<Holding>) => {
+    savePortItem({ id, ...patch }).then((saved) => {
+      setPortfolioRows((prev) => {
+        const next = prev.map((holding) => holding.id === id ? { ...holding, ...saved } : holding);
+        try { localStorage.setItem("qj_portfolio", JSON.stringify(next)); } catch { /* ignore */ }
+        return next;
+      });
+    }).catch(console.error);
   };
 
   return (
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
-        <Route path="/dashboard" element={<TerminalShell active="dashboard"><DashboardPage journal={journalRows} portfolio={portfolioRows} onAddTrade={addJournalEntry} watchlist={liveWatchlist} selectedSymbol={dashboardSymbol} onSelectSymbol={setDashboardSymbol} onAddWatchSymbol={addWatchSymbol} onRemoveWatchSymbol={removeWatchSymbol} onClearWatchlist={() => setWatchlistRows([])} /></TerminalShell>} />
-        <Route path="/markets" element={<TerminalShell active="markets"><MarketsPage portfolio={portfolioRows} watchlist={liveWatchlist} /></TerminalShell>} />
-        <Route path="/intelligence" element={<TerminalShell active="intelligence"><IntelligencePage watchlist={liveWatchlist} /></TerminalShell>} />
-        <Route path="/journal" element={<TerminalShell active="journal"><JournalPage rows={journalRows} onAddTrade={addJournalEntry} watchlist={liveWatchlist} /></TerminalShell>} />
-        <Route path="/portfolio" element={<TerminalShell active="portfolio"><PortfolioPage rows={portfolioRows} onAddHolding={addPortfolioHolding} watchlist={liveWatchlist} /></TerminalShell>} />
-        <Route path="/strategy" element={<TerminalShell active="strategy"><StrategyPage watchlist={liveWatchlist} onAddTrade={addJournalEntry} /></TerminalShell>} />
-        <Route path="/ai" element={<TerminalShell active="ai"><AiPage watchlist={liveWatchlist} /></TerminalShell>} />
-        <Route path="/settings" element={<TerminalShell active="settings"><SettingsPage /></TerminalShell>} />
+        <Route path="/dashboard" element={<TerminalShell active="dashboard" symbol={dashboardSymbol} onSymbolChange={handleGlobalSymbolChange} watchlist={liveWatchlist} onLogout={onLogout}><DashboardPage journal={journalRows} portfolio={portfolioRows} onAddTrade={addJournalEntry} watchlist={liveWatchlist} selectedSymbol={dashboardSymbol} onSelectSymbol={setDashboardSymbol} onAddWatchSymbol={addWatchSymbol} onRemoveWatchSymbol={removeWatchSymbol} onClearWatchlist={() => setWatchlistRows([])} /></TerminalShell>} />
+        <Route path="/markets" element={<TerminalShell active="markets" symbol={dashboardSymbol} onSymbolChange={handleGlobalSymbolChange} watchlist={liveWatchlist} onLogout={onLogout}><MarketsPage portfolio={portfolioRows} watchlist={liveWatchlist} /></TerminalShell>} />
+        <Route path="/intelligence" element={<TerminalShell active="intelligence" symbol={dashboardSymbol} onSymbolChange={handleGlobalSymbolChange} watchlist={liveWatchlist} onLogout={onLogout}><IntelligencePage watchlist={liveWatchlist} /></TerminalShell>} />
+        <Route path="/journal" element={<TerminalShell active="journal" symbol={dashboardSymbol} onSymbolChange={handleGlobalSymbolChange} watchlist={liveWatchlist} onLogout={onLogout}><JournalPage rows={journalRows} onAddTrade={addJournalEntry} onUpdateTrade={updateJournalEntry} watchlist={liveWatchlist} /></TerminalShell>} />
+        <Route path="/portfolio" element={<TerminalShell active="portfolio" symbol={dashboardSymbol} onSymbolChange={handleGlobalSymbolChange} watchlist={liveWatchlist} onLogout={onLogout}><PortfolioPage rows={portfolioRows} onAddHolding={addPortfolioHolding} onUpdateHolding={updatePortfolioHolding} watchlist={liveWatchlist} /></TerminalShell>} />
+        <Route path="/strategy" element={<TerminalShell active="strategy" symbol={dashboardSymbol} onSymbolChange={handleGlobalSymbolChange} watchlist={liveWatchlist} onLogout={onLogout}><StrategyPage watchlist={liveWatchlist} onAddTrade={addJournalEntry} /></TerminalShell>} />
+        <Route path="/ai" element={
+          <TerminalShell active="ai" symbol={dashboardSymbol} onSymbolChange={handleGlobalSymbolChange} watchlist={liveWatchlist} onLogout={onLogout}>
+            <AiPage 
+              watchlist={liveWatchlist} 
+              portfolio={portfolioRows}
+              threads={chatThreads} 
+              activeThreadId={activeThreadId}
+              onSwitchThread={setActiveThreadId}
+              onUpdateThreads={setChatThreads}
+            />
+          </TerminalShell>
+        } />
+        <Route path="/settings" element={<TerminalShell active="settings" symbol={dashboardSymbol} onSymbolChange={handleGlobalSymbolChange} watchlist={liveWatchlist} onLogout={onLogout}><SettingsPage /></TerminalShell>} />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>
     </BrowserRouter>
   );
 }
 
-function TerminalShell({ active, children }: { active: RouteKey; children: ReactNode }) {
+function TerminalShell({ 
+  children, 
+  active, 
+  symbol, 
+  onSymbolChange, 
+  watchlist,
+  onLogout
+}: { 
+  children: React.ReactNode; 
+  active: RouteKey; 
+  symbol?: SymbolKey;
+  onSymbolChange?: (s: SymbolKey) => void;
+  watchlist?: WatchSymbol[];
+  onLogout: () => void;
+}) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const [showResults, setShowResults] = useState(false);
+
+  const filtered = watchlist?.filter(w => 
+    w.symbol.toLowerCase().includes(searchQuery.toLowerCase()) || 
+    w.name.toLowerCase().includes(searchQuery.toLowerCase())
+  ).slice(0, 5) || [];
+
   return (
-    <div className="flex h-dvh overflow-hidden bg-background text-foreground">
+    <div className="flex h-dvh overflow-hidden bg-background text-foreground selection:bg-primary/30">
       <SideRail active={active} />
       <div className="flex min-w-0 flex-1 flex-col">
-        <TopBar active={active} />
-        <main className="min-h-0 flex-1 overflow-hidden max-md:overflow-auto">{children}</main>
+        <header className="flex h-14 shrink-0 items-center justify-start gap-8 border-b border-border bg-[#050505] px-6 max-md:gap-4 max-md:px-4">
+          <div className="flex items-center gap-3">
+            <span className="size-2 rounded-full bg-primary shadow-[0_0_12px_hsl(var(--primary))]" />
+            <span className="text-lg font-black uppercase tracking-tighter text-white max-md:hidden">Quant<span className="text-primary">Core</span></span>
+          </div>
+          
+          {symbol ? (
+            <div className="flex items-center gap-4 border-l border-border pl-8 max-md:hidden">
+              <span className="label-caps opacity-50">Active Asset</span>
+              <span className="font-data text-lg font-bold text-white">${symbol}</span>
+              <Badge variant="outline" className="rounded-sm"><span className="mr-1 size-1.5 rounded-full bg-primary animate-pulse" />Live</Badge>
+            </div>
+          ) : null}
+
+          <div className="relative w-full max-w-sm">
+            <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-zinc-500" />
+            <Input 
+              className="h-9 rounded-sm border-border bg-background pl-10 font-data text-sm focus:border-primary/50" 
+              placeholder="Search instrument or research vector..." 
+              value={searchQuery}
+              onChange={(e) => {
+                setSearchQuery(e.target.value);
+                setShowResults(true);
+              }}
+              onFocus={() => setShowResults(true)}
+              onBlur={() => setTimeout(() => setShowResults(false), 200)}
+            />
+            
+            {showResults && searchQuery && (
+              <div className="absolute top-full z-50 mt-1 w-full border border-border bg-card/95 p-1 shadow-2xl backdrop-blur-xl">
+                {searchQuery.length >= 2 && !watchlist?.some(w => w.symbol.toLowerCase() === searchQuery.toLowerCase()) && (
+                  <div 
+                    className="flex cursor-pointer items-center justify-between rounded-sm px-3 py-3 border-b border-border/50 bg-primary/5 hover:bg-primary/20 text-white"
+                    onClick={() => {
+                      onSymbolChange?.(searchQuery.toUpperCase() as SymbolKey);
+                      setSearchQuery("");
+                      setShowResults(false);
+                    }}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="size-6 flex items-center justify-center rounded-full bg-primary/20"><Globe className="size-3 text-primary" /></div>
+                      <div className="flex flex-col">
+                        <span className="font-data font-bold">Research Global Market for ${searchQuery.toUpperCase()}</span>
+                        <span className="text-[9px] text-primary uppercase tracking-widest">Live Dynamic Fetch</span>
+                      </div>
+                    </div>
+                    <Zap className="size-3 text-primary animate-pulse" />
+                  </div>
+                )}
+                {filtered.length > 0 ? filtered.map(item => (
+                  <div 
+                    key={item.symbol}
+                    className="flex cursor-pointer items-center justify-between rounded-sm px-3 py-2 hover:bg-primary/10 hover:text-white"
+                    onClick={() => {
+                      onSymbolChange?.(item.symbol);
+                      setSearchQuery("");
+                      setShowResults(false);
+                    }}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="font-data font-bold">${item.symbol}</span>
+                      <span className="text-[10px] text-muted-foreground uppercase">{item.name}</span>
+                    </div>
+                    <span className={cn("font-data text-[10px]", item.change >= 0 ? "text-emerald-400" : "text-rose-400")}>
+                      {item.changePercent.toFixed(2)}%
+                    </span>
+                  </div>
+                )) : searchQuery.length < 2 && (
+                  <div className="p-4 text-center text-xs text-muted-foreground italic">Enter ticker or name...</div>
+                )}
+              </div>
+            )}
+            <div className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border border-border bg-card px-1.5 py-0.5 text-[10px] text-zinc-500">
+              CMD+K
+            </div>
+          </div>
+
+          <div className="ml-auto flex items-center gap-4">
+            <StatusPill />
+            <IconOnly icon={Bell} label="Alerts" />
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              title="Sign out"
+              onClick={() => logout().finally(onLogout)}
+            >
+              <CircleUserRound data-icon="icon" />
+            </Button>
+          </div>
+        </header>
+
+        <main className="min-h-0 flex-1 overflow-hidden max-md:overflow-auto">
+          {children}
+        </main>
         <FooterBar />
       </div>
     </div>
-  );
-}
-
-function TopBar({ active }: { active: RouteKey }) {
-  const title = active === "ai" ? "QUANTCORE" : active === "journal" ? "AUDIT TERMINAL // 2024.V4" : "QuantJournal";
-
-  return (
-    <header className="flex h-[60px] shrink-0 items-center gap-3 border-b border-border bg-[#050505] px-5 max-lg:px-3 max-md:h-auto max-md:min-h-14 max-md:flex-wrap max-md:py-2">
-      <div className="flex min-w-[170px] items-center gap-3 border-r border-border pr-5 max-md:min-w-0 max-md:border-r-0 max-md:pr-0">
-        <span className="size-2.5 rounded-sm bg-primary shadow-[0_0_18px_hsl(var(--primary))]" />
-        <span className="truncate text-xl font-black tracking-tight text-white max-md:text-base">{title}</span>
-      </div>
-      <div className="ml-5 flex min-w-0 flex-1 items-center gap-5 max-lg:ml-0 max-md:order-3 max-md:basis-full">
-        {active === "ai" ? (
-          <div className="hidden items-center gap-3 md:flex">
-            <span className="label-caps">Active Asset</span>
-            <span className="font-data text-lg font-bold text-primary">$NVDA</span>
-            <Badge variant="outline" className="rounded-sm"><span className="mr-1 size-1.5 rounded-full bg-primary" />Live</Badge>
-          </div>
-        ) : null}
-        <div className="relative w-full max-w-[440px] max-md:max-w-none">
-          <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-primary" />
-          <Input className="h-9 rounded-sm border-border bg-background pl-10 font-data text-sm" readOnly value={active === "dashboard" ? "Search instrument, order, thread..." : active === "strategy" ? "Search Tickers (AAPL, NVDA)" : "CMD+K to search"} />
-        </div>
-      </div>
-      <div className="ml-auto flex items-center gap-3 max-md:gap-1">
-        <StatusPill />
-        <span className="max-[520px]:hidden"><IconOnly icon={Bell} label="Alerts" /></span>
-        <IconOnly icon={Settings} label="Settings" />
-        {active !== "dashboard" ? <span className="max-[520px]:hidden"><IconOnly icon={CircleUserRound} label="Operator" /></span> : null}
-      </div>
-    </header>
   );
 }
 
@@ -938,32 +1194,84 @@ function MarketsPage({ portfolio, watchlist }: { portfolio: Holding[]; watchlist
   );
 }
 
+const labResolutionMap: Record<string, string> = { 
+  "1m": "1", 
+  "5m": "5", 
+  "1h": "60", 
+  "1d": "D", 
+  "1M": "M", 
+  "1Y": "12M", 
+  "5Y": "60M", 
+  "MAX": "MAX" 
+};
+
 function LabPage({ watchlist, onAddTrade }: { watchlist: WatchSymbol[]; onAddTrade: (row: AuditRow) => void }) {
+  const [ticker, setTicker] = useState<SymbolKey>("NVDA");
+  const [tfLabel, setTfLabel] = useState("5m");
+  const resolution = labResolutionMap[tfLabel] ?? "5";
   const [simulationRows, setSimulationRows] = useState<AuditRow[]>([]);
+
+  const { candles, isLoading } = useMarketData(ticker, resolution);
+
+  const rvol = useMemo(() => {
+    if (candles.length < 6) return 1.0;
+    const recent = candles.slice(-5).reduce((s, c) => s + c.volume, 0) / 5;
+    const hist = candles.slice(-25, -5);
+    const base = hist.length ? hist.reduce((s, c) => s + c.volume, 0) / hist.length : 1;
+    return base > 0 ? recent / base : 1.0;
+  }, [candles]);
+
+  const profitFactor = useMemo(() => {
+    const nums = simulationRows.map((r) => parseFloat(r[7].replace(/[^0-9.-]/g, ""))).filter((n) => !isNaN(n));
+    const gains = nums.filter((n) => n > 0).reduce((s, n) => s + n, 0);
+    const losses = Math.abs(nums.filter((n) => n < 0).reduce((s, n) => s + n, 0));
+    if (losses === 0) return gains > 0 ? 99 : 0;
+    return gains / losses;
+  }, [simulationRows]);
+
   const addSimulation = (row: AuditRow) => {
-    setSimulationRows([row, ...simulationRows]);
+    setSimulationRows((prev) => [row, ...prev]);
     onAddTrade(row);
+  };
+
+  const exportCsv = () => {
+    const headers = ["Timestamp", "Ticker", "Side", "Price", "Duration", "R:R", "Tag", "P&L", "Notes"];
+    const lines = simulationRows.map((r) => r.map((cell) => `"${cell}"`).join(","));
+    const csv = [headers.join(","), ...lines].join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sim-${ticker}-${Date.now()}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
     <div className="grid min-h-full gap-4 overflow-auto p-4 xl:h-full xl:grid-cols-[420px_minmax(0,1fr)] xl:overflow-hidden max-md:p-3">
-      <StrategyConfig onRunSimulation={addSimulation} watchlist={watchlist} />
+      <StrategyConfig ticker={ticker} onTickerChange={setTicker} onRunSimulation={addSimulation} watchlist={watchlist} />
       <div className="grid min-h-0 gap-4 xl:grid-rows-[minmax(0,1fr)_360px]">
         <Panel className="min-h-0">
           <div className="flex h-12 items-center justify-between border-b border-border px-4">
-            <ToggleGroup type="single" defaultValue="5m" className="rounded-sm border border-border bg-background">
-              {["1m", "5m", "1h", "1d"].map((item) => <ToggleGroupItem key={item} value={item} className="rounded-sm font-data text-xs">{item}</ToggleGroupItem>)}
+            <ToggleGroup type="single" value={tfLabel} onValueChange={(v) => v && setTfLabel(v)} className="rounded-sm border border-border bg-background">
+              {["1m", "5m", "15m", "1h", "1d", "1M", "1Y", "5Y", "MAX"].map((item) => <ToggleGroupItem key={item} value={item} className="rounded-sm font-data text-xs uppercase">{item}</ToggleGroupItem>)}
             </ToggleGroup>
-            <div className="flex items-center gap-5 font-data text-sm"><span>RVOL: 1.84</span><span className="text-emerald-400">Profit Factor: 2.15</span><Maximize2 className="size-4" /><Camera className="size-4" /></div>
+            <div className="flex items-center gap-5 font-data text-sm">
+              <span>RVOL: {rvol.toFixed(2)}</span>
+              <span className="text-emerald-400">Profit Factor: {profitFactor === 99 ? "∞" : profitFactor.toFixed(2)}</span>
+              <Maximize2 className="size-4 cursor-pointer" />
+              <Camera className="size-4 cursor-pointer" />
+            </div>
           </div>
-          <div className="relative h-[calc(100%-48px)]">
-            <MarketSvg />
-            <Badge className="absolute left-[30%] top-[44%] rounded-none bg-emerald-500 text-black">B: VWAP_TOUCH</Badge>
-            <Badge variant="destructive" className="absolute left-[52%] top-[31%] rounded-none">S: LVN_REJECTION</Badge>
+          <div className="h-[calc(100%-48px)]">
+            {isLoading ? (
+              <div className="flex h-full items-center justify-center font-data text-sm text-muted-foreground">Loading {ticker}…</div>
+            ) : (
+              <LabCandleChart candles={candles} />
+            )}
           </div>
         </Panel>
         <Panel>
-          <PanelTitle title="Simulation Runs" action={<Button variant="outline" size="sm">Export CSV</Button>} />
+          <PanelTitle title="Simulation Runs" action={<Button variant="outline" size="sm" onClick={exportCsv} disabled={simulationRows.length === 0}>Export CSV</Button>} />
           <AuditTable compact rows={simulationRows} />
         </Panel>
       </div>
@@ -971,23 +1279,37 @@ function LabPage({ watchlist, onAddTrade }: { watchlist: WatchSymbol[]; onAddTra
   );
 }
 
-function StrategyConfig({ onRunSimulation, watchlist }: { onRunSimulation: (row: AuditRow) => void; watchlist: WatchSymbol[] }) {
+function StrategyConfig({
+  ticker,
+  onTickerChange,
+  onRunSimulation,
+  watchlist
+}: {
+  ticker: SymbolKey;
+  onTickerChange: (t: SymbolKey) => void;
+  onRunSimulation: (row: AuditRow) => void;
+  watchlist: WatchSymbol[];
+}) {
   const [ema, setEma] = useState([9]);
   const [rvol, setRvol] = useState([1.5]);
   const [risk, setRisk] = useState([500]);
   const [correlation, setCorrelation] = useState([82]);
   const [atr, setAtr] = useState([2]);
   const [scenario, setScenario] = useState({
-    ticker: "NVDA",
     name: "VWAP Retest",
     entry: "VWAP reclaim with RSI divergence",
     exit: "Trim at 2R, invalidate below anchor low"
   });
-  const selected = watchlist.find((item) => item.symbol === scenario.ticker) ?? watchlist[0];
+  const selected = watchlist.find((item) => item.symbol === ticker) ?? watchlist[0];
+  const positionSize = useMemo(() => {
+    const price = selected?.last ?? 1;
+    return Math.max(1, Math.floor(risk[0] / (price * 0.01 * atr[0])));
+  }, [risk, atr, selected?.last]);
+
   const runSimulation = () => {
     onRunSimulation([
       new Date().toISOString().slice(0, 19).replace("T", " "),
-      scenario.ticker,
+      ticker,
       "BUY",
       number(selected.last),
       "SIM",
@@ -1008,7 +1330,7 @@ function StrategyConfig({ onRunSimulation, watchlist }: { onRunSimulation: (row:
         <div className="flex flex-col gap-6 p-4 pb-8">
           <ConfigGroup title="Asset Target">
             <label className="label-caps">Stock Ticker</label>
-            <Select value={scenario.ticker} onValueChange={(ticker) => setScenario({ ...scenario, ticker })}>
+            <Select value={ticker} onValueChange={(v) => onTickerChange(v as SymbolKey)}>
               <SelectTrigger className="h-10 w-full rounded-sm border-border bg-background font-data">
                 <SelectValue placeholder="Select watchlist stock" />
               </SelectTrigger>
@@ -1016,7 +1338,7 @@ function StrategyConfig({ onRunSimulation, watchlist }: { onRunSimulation: (row:
                 <SelectGroup>
                   {watchlist.map((item) => (
                     <SelectItem key={item.symbol} value={item.symbol}>
-                      {item.symbol} - {item.name}
+                      {item.symbol} — {item.name}
                     </SelectItem>
                   ))}
                 </SelectGroup>
@@ -1036,7 +1358,7 @@ function StrategyConfig({ onRunSimulation, watchlist }: { onRunSimulation: (row:
           </ConfigGroup>
           <ConfigGroup title="Indicator Settings">
             <SliderRow label="EMA Period (Fast/Slow)" value={`${ema[0]} / 21`} sliderValue={ema} setSliderValue={setEma} min={5} max={20} step={1} />
-            <SliderRow label="Sector Correlation (SPY)" value={`${correlation[0] / 100}`} sliderValue={correlation} setSliderValue={setCorrelation} min={0} max={100} step={1} checked />
+            <SliderRow label="Sector Correlation (SPY)" value={(correlation[0] / 100).toFixed(2)} sliderValue={correlation} setSliderValue={setCorrelation} min={0} max={100} step={1} checked />
             <SliderRow label="Relative Volume (RVOL)" value={rvol[0].toFixed(1)} sliderValue={rvol} setSliderValue={setRvol} min={0.5} max={3} step={0.1} />
           </ConfigGroup>
           <ConfigGroup title="Risk Architecture">
@@ -1044,7 +1366,7 @@ function StrategyConfig({ onRunSimulation, watchlist }: { onRunSimulation: (row:
             <SliderRow label="Risk Per Trade ($)" value={String(risk[0])} sliderValue={risk} setSliderValue={setRisk} min={100} max={2000} step={50} />
             <div className="border border-border bg-card p-3">
               <div className="flex items-center justify-between label-caps"><span>Calculated Position Size</span><span className="text-primary">Auto-calc</span></div>
-              <div className="mt-3 flex items-end justify-between"><span className="font-data text-3xl font-bold text-white">142</span><span className="text-muted-foreground">SHARES</span></div>
+              <div className="mt-3 flex items-end justify-between"><span className="font-data text-3xl font-bold text-white">{positionSize}</span><span className="text-muted-foreground">SHARES</span></div>
             </div>
           </ConfigGroup>
         </div>
@@ -1054,6 +1376,52 @@ function StrategyConfig({ onRunSimulation, watchlist }: { onRunSimulation: (row:
       </div>
     </Panel>
   );
+}
+
+function LabCandleChart({ candles }: { candles: Candle[] }) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const volRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+
+  useEffect(() => {
+    if (!hostRef.current) return;
+    const chart = createChart(hostRef.current, {
+      layout: { background: { color: "transparent" }, textColor: "#a1a1aa" },
+      grid: { vertLines: { color: "rgba(255,255,255,0.04)" }, horzLines: { color: "rgba(255,255,255,0.04)" } },
+      rightPriceScale: { borderColor: "#27272a" },
+      timeScale: { borderColor: "#27272a", timeVisible: true },
+      autoSize: true
+    });
+    const cs = chart.addSeries(CandlestickSeries, {
+      upColor: "#34d399", downColor: "#fca5a5",
+      borderUpColor: "#34d399", borderDownColor: "#fca5a5",
+      wickUpColor: "#34d399", wickDownColor: "#fca5a5"
+    });
+    const vs = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: "volume" }, priceScaleId: "",
+      color: "rgba(192,193,255,0.28)", lastValueVisible: false, priceLineVisible: false
+    });
+    vs.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+    chartRef.current = chart;
+    candleRef.current = cs;
+    volRef.current = vs;
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+      candleRef.current = null;
+      volRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!candleRef.current || !volRef.current || !candles.length) return;
+    candleRef.current.setData(candles.map((c) => ({ time: c.time as Time, open: c.open, high: c.high, low: c.low, close: c.close })));
+    volRef.current.setData(candles.map((c) => ({ time: c.time as Time, value: c.volume, color: c.close >= c.open ? "rgba(52,211,153,0.24)" : "rgba(252,165,165,0.24)" })));
+    chartRef.current?.timeScale().fitContent();
+  }, [candles]);
+
+  return <div ref={hostRef} className="h-full w-full" />;
 }
 
 function IntelligencePage({ watchlist }: { watchlist: WatchSymbol[] }) {
@@ -1150,120 +1518,485 @@ function SignalStat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function AiPage({ watchlist }: { watchlist: WatchSymbol[] }) {
+function AiPage({ 
+  watchlist, 
+  portfolio,
+  threads, 
+  activeThreadId, 
+  onSwitchThread, 
+  onUpdateThreads 
+}: { 
+  watchlist: WatchSymbol[]; 
+  portfolio: Holding[];
+  threads: ChatThread[]; 
+  activeThreadId: string | null; 
+  onSwitchThread: (id: string | null) => void; 
+  onUpdateThreads: (threads: ChatThread[] | ((prev: ChatThread[]) => ChatThread[])) => void; 
+}) {
   const [prompt, setPrompt] = useState("");
-  const [symbol, setSymbol] = useState<SymbolKey>("NVDA");
   const [isSending, setIsSending] = useState(false);
+  const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const [memoryDraft, setMemoryDraft] = useState("");
+  const [attachmentTitle, setAttachmentTitle] = useState("");
+  const [attachmentDraft, setAttachmentDraft] = useState("");
+  const [isSavingContext, setIsSavingContext] = useState(false);
+  const [chatMode, setChatMode] = useState("Long-Term Investor");
   const endRef = useRef<HTMLDivElement | null>(null);
+
+  // Auto-create thread if activeThreadId is a "new-" placeholder
+  useEffect(() => {
+    if (activeThreadId?.startsWith("new-")) {
+      const s = activeThreadId.split("-")[1] as SymbolKey;
+      createNewThread(s);
+    }
+  }, [activeThreadId]);
+  
+  const activeThread = threads.find(t => t.id === activeThreadId) || null;
+  const symbol = activeThread?.symbol ?? "NVDA";
+  const messages = activeThread?.messages ?? [];
+
   const { candles, quote, marketNews, error } = useMarketData(symbol, "D");
   const selected = selectedQuote(symbol, quote);
-  const [messages, setMessages] = useState<ChatUiMessage[]>([
-    {
-      id: "system",
-      type: "system",
-      text: "Operational context locked to $NVDA. Massive market data is synchronized when API keys are configured. Specify analysis vectors."
-    },
-    {
-      id: "operator",
-      type: "operator",
-      text: "Analyze price action over the last 4 hours. Cross-reference institutional accumulation near VWAP with 15m RSI momentum."
-    },
-    {
-      id: "analysis",
-      type: "analysis",
-      text: "Aggregating real-time flow data. Institutional dark pool liquidity is highly concentrated at $889.10. 15m RSI shows hidden bullish divergence during the last retest of the VWAP anchor."
-    }
-  ]);
+
+  const refreshMemories = () => {
+    fetchMemories(symbol).then(setMemories).catch(() => setMemories([]));
+  };
+
+  useEffect(() => {
+    refreshMemories();
+  }, [symbol]);
+
+  const savePinnedMemory = () => {
+    const content = memoryDraft.trim();
+    if (!content || isSavingContext) return;
+    setIsSavingContext(true);
+    createMemory({
+      category: "investment_style",
+      content,
+      symbol: "GLOBAL",
+      source: "user_pinned",
+      pinned: true
+    }).then(() => {
+      setMemoryDraft("");
+      refreshMemories();
+    }).finally(() => setIsSavingContext(false));
+  };
+
+  const saveAttachment = () => {
+    const content = attachmentDraft.trim();
+    if (!content || isSavingContext) return;
+    setIsSavingContext(true);
+    createContextAttachment({
+      title: attachmentTitle.trim() || `Context for ${symbol}`,
+      content,
+      symbol,
+      scope: "symbol"
+    }).then(() => {
+      setAttachmentTitle("");
+      setAttachmentDraft("");
+      refreshMemories();
+    }).finally(() => setIsSavingContext(false));
+  };
+
+  const createNewThread = (initialSymbol: SymbolKey = "NVDA") => {
+    const newThread: ChatThread = {
+      id: crypto.randomUUID(),
+      title: `New Analysis: ${initialSymbol}`,
+      symbol: initialSymbol,
+      messages: [{
+        id: "system",
+        type: "system",
+        text: `Operational context locked to $${initialSymbol}. Deep-RAG and Web-Search engines initialized.`
+      }],
+      lastActive: Date.now()
+    };
+    onUpdateThreads(prev => [newThread, ...prev]);
+    onSwitchThread(newThread.id);
+    return newThread;
+  };
+
+  const deleteThread = (id: string) => {
+    onUpdateThreads(prev => {
+      const next = prev.filter(t => t.id !== id);
+      if (activeThreadId === id) {
+        if (next.length > 0) onSwitchThread(next[0].id);
+        else onSwitchThread(null);
+      }
+      return next;
+    });
+  };
+
   const runPrompt = () => {
     const trimmed = prompt.trim();
     if (!trimmed || isSending) return;
-    const nextMessages = [...messages, { id: crypto.randomUUID(), type: "operator" as const, text: trimmed }];
-    setMessages(nextMessages);
+    
+    const targetThread = activeThread ?? createNewThread(symbol);
+    const targetThreadId = targetThread.id;
+    const targetMessages = activeThread ? messages : targetThread.messages;
+
+    const operatorMsg: ChatUiMessage = { id: crypto.randomUUID(), type: "operator", text: trimmed };
+    const nextMessages = [...targetMessages, operatorMsg];
+    
+    onUpdateThreads(prev => prev.map(t => t.id === targetThreadId ? { ...t, messages: nextMessages, lastActive: Date.now() } : t));
     setPrompt("");
     setIsSending(true);
+
     chatAboutMarket({
       symbol,
       quote: selected,
       candles,
       news: marketNews,
+      portfolio,
+      chatMode,
       prompt: trimmed,
-      messages: nextMessages.map((message) => ({ role: message.type === "operator" ? "user" : "assistant", content: message.text }))
+      messages: nextMessages.map((msg) => ({ role: msg.type === "operator" ? "user" : "assistant", content: msg.text }))
     }).then((result) => {
-      setMessages((current) => [...current, { id: crypto.randomUUID(), type: "analysis", text: result.content }]);
+      const analysisMsg: ChatUiMessage = { 
+        id: crypto.randomUUID(), 
+        type: "analysis", 
+        text: result.content,
+        activity: result.activity,
+        sources: result.sources,
+        memorySaved: result.memorySaved
+      };
+      onUpdateThreads(prev => prev.map(t => t.id === targetThreadId ? { 
+        ...t, 
+        messages: [...t.messages, analysisMsg],
+        title: t.messages.length < 3 ? trimmed.slice(0, 30) + (trimmed.length > 30 ? "..." : "") : t.title
+      } : t));
+      if (result.memorySaved?.length) refreshMemories();
     }).catch((err) => {
-      setMessages((current) => [...current, { id: crypto.randomUUID(), type: "analysis", text: err instanceof Error ? err.message : "AI request failed." }]);
+      onUpdateThreads(prev => prev.map(t => t.id === targetThreadId ? { 
+        ...t, 
+        messages: [...t.messages, { id: crypto.randomUUID(), type: "analysis", text: err instanceof Error ? err.message : "AI request failed." }] 
+      } : t));
     }).finally(() => {
       setIsSending(false);
     });
   };
+
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
-  useEffect(() => {
-    setMessages((current) => [
-      { id: crypto.randomUUID(), type: "system", text: `Operational context switched to $${symbol}. ${error ? "Using local fallback market data until Massive is available." : "Massive market context is active."}` },
-      ...current.filter((message) => message.type !== "system").slice(-6)
-    ]);
-  }, [error, symbol]);
 
   return (
-    <div className="grid h-full min-h-0 grid-cols-[minmax(0,1fr)_340px] overflow-hidden max-xl:grid-cols-1 max-xl:overflow-auto">
-      <div className="flex min-h-0 flex-col">
+    <div className="flex h-full min-h-0 overflow-hidden max-xl:flex-col max-xl:overflow-auto">
+      <ThreadSidebar 
+        threads={threads} 
+        activeId={activeThreadId} 
+        onSwitch={onSwitchThread} 
+        onNew={createNewThread} 
+        onDelete={deleteThread} 
+      />
+      <div className="flex min-w-0 flex-1 flex-col border-r border-border">
         <div className="flex min-h-10 items-center justify-between gap-3 border-b border-border px-5 py-2 label-caps max-md:flex-wrap max-md:px-3">
-          <span><span className="mr-2 inline-block size-2 rounded-full bg-muted-foreground" />AI Engine: DeepSeek V4 | Active: ${symbol}</span>
-          <div className="flex items-center gap-4">
-            <span className="max-md:hidden">Price: {currency(selected.last)}&nbsp;&nbsp; Move: {signed(selected.changePercent, "%")}</span>
-            <Button variant="ghost" size="sm" onClick={() => setMessages([])}>Clear Chat</Button>
+          <div className="flex items-center gap-3">
+            <span className="size-2 rounded-full bg-primary shadow-[0_0_8px_hsl(var(--primary))]" />
+            <span className="truncate">Active Cluster: {symbol} | Deep-RAG Engine Active</span>
+          </div>
+          <div className="flex items-center gap-4 max-sm:hidden">
+            <Badge variant="outline" className="border-primary/30 font-data text-primary uppercase">{selected.venue}</Badge>
+            <span className="font-data text-white">{currency(selected.last)}</span>
           </div>
         </div>
+        
         <ScrollArea className="min-h-0 flex-1">
-          <div className="mx-auto flex max-w-4xl flex-col gap-5 p-5 max-md:p-3">
-            {messages.map((message) => {
+          <div className="mx-auto flex max-w-4xl flex-col gap-6 p-6 max-md:p-4">
+            <ChatModeBar mode={chatMode} onModeChange={setChatMode} />
+            {!activeThread ? (
+              <div className="flex flex-col items-center justify-center py-20 text-center">
+                <div className="mb-6 flex size-16 items-center justify-center rounded-full border border-primary/20 bg-primary/5">
+                  <Bot className="size-8 text-primary" />
+                </div>
+                <h2 className="text-xl font-bold text-white uppercase tracking-widest">Awaiting Analysis Thread</h2>
+                <p className="mt-2 text-sm text-muted-foreground">Select a thread from the sidebar or start a new quantitative session.</p>
+                <Button onClick={() => createNewThread()} className="mt-8 rounded-none px-10 uppercase tracking-tighter">Initialize Engine</Button>
+              </div>
+            ) : messages.map((message) => {
               if (message.type === "system") {
-                return <MessageBlock key={message.id} icon={Cpu} kicker="QJ_CORE_SYSTEM  14:02:44.201">{renderTickerText(message.text)}</MessageBlock>;
+                return <MessageBlock key={message.id} icon={Cpu} kicker="SYS_BOOT_SEQUENCE">{renderTickerText(message.text)}</MessageBlock>;
               }
               if (message.type === "operator") {
-                return <div key={message.id} className="self-end max-w-2xl border-r border-border bg-card/40 p-4 pr-5 text-right text-sm leading-6 text-white">{message.text}</div>;
+                return (
+                  <div key={message.id} className="flex flex-col items-end gap-2">
+                    <div className="max-w-[85%] rounded-sm border border-border bg-card/40 p-4 text-sm leading-6 text-zinc-100 shadow-sm">
+                      {message.text}
+                    </div>
+                    <span className="label-caps text-[10px]">Operator Request</span>
+                  </div>
+                );
               }
               return (
-                <MessageBlock key={message.id} icon={ChartNoAxesCombined} kicker="ANALYSTS_OUTPUT  14:05:18.115">
-                  <div className="border border-blue-950 bg-card p-4">
-                    <p className="text-sm leading-6">{renderTickerText(message.text)}</p>
-                    <div className="mt-4 grid grid-cols-2 gap-3 max-md:grid-cols-1">
-                      <FlowCard title="VWAP Anchor Analysis" value="$889.10" footer="Vol Strength: High 78.2% Absorption" />
-                      <FlowCard title="Dark Pool Flow" value="+1.42B" footer="Bullish Conviction Institutional Tier" green />
-                    </div>
-                    <div className="mt-4 border-t border-blue-950 pt-4"><div className="grid grid-cols-3 gap-5 max-sm:grid-cols-1"><MetricInline label="Prob. Upside" value="82.4%" /><MetricInline label="Delta Neutral" value="0.042" /><MetricInline label="Gamma Exposure" value="+2.1M" /></div></div>
+                <MessageBlock key={message.id} icon={ChartNoAxesCombined} kicker={`ANALYSIS_GEN_${message.sources?.toUpperCase() ?? "LOCAL"}`}>
+                  <div className="space-y-4 rounded-sm border border-primary/10 bg-card/60 p-5 shadow-inner">
+                    {message.activity && (
+                      <div className="mb-4 space-y-1 border-b border-border/50 pb-4">
+                        {message.activity.map((act, i) => (
+                          <div key={i} className="font-data text-[10px] text-primary/70 animate-pulse">{act}</div>
+                        ))}
+                      </div>
+                    )}
+                    <p className="whitespace-pre-wrap text-sm leading-7 text-zinc-200">{renderTickerText(message.text)}</p>
+                    
+                    {message.sources === "web" && (
+                      <div className="mt-6 flex items-center gap-2 border-t border-border pt-4">
+                        <Badge variant="outline" className="rounded-none border-emerald-500/20 bg-emerald-500/5 text-[10px] text-emerald-400">WEB SEARCH ACTIVE</Badge>
+                        <span className="label-caps text-[10px]">Grounding in Live Data</span>
+                      </div>
+                    )}
+                    {message.memorySaved && message.memorySaved.length > 0 && (
+                      <div className="mt-3 flex items-center gap-2">
+                        <Badge variant="outline" className="rounded-none border-primary/30 text-[10px] text-primary">MEMORY UPDATED</Badge>
+                        <span className="label-caps text-[10px]">{message.memorySaved.length} durable item saved</span>
+                      </div>
+                    )}
                   </div>
                 </MessageBlock>
               );
             })}
-            {!messages.length ? (
-              <Panel className="p-8 text-center">
-                <div className="label-caps">Chat Cleared</div>
-                <p className="mt-2 text-sm text-muted-foreground">Enter a new command below to start a fresh analysis thread.</p>
-              </Panel>
-            ) : null}
             <div ref={endRef} />
           </div>
         </ScrollArea>
-        <div className="border-t border-border p-4">
-          <div className="flex items-center gap-3 border border-blue-950 bg-background p-2 max-sm:flex-wrap">
-            <span className="font-data text-primary">$</span>
+
+        <div className="border-t border-border bg-[#030303] p-4">
+          <div className="mx-auto flex max-w-4xl items-center gap-3 border border-primary/20 bg-background/50 p-2 shadow-2xl focus-within:border-primary/50">
+            <span className="pl-2 font-data font-bold text-primary">$</span>
             <Input
-              className="h-9 min-w-0 flex-1 border-0 bg-transparent font-data"
-              placeholder="Awaiting next command..."
+              className="h-10 min-w-0 flex-1 border-0 bg-transparent font-data text-sm focus-visible:ring-0"
+              placeholder={isSending ? "Synthesizing market data..." : "Enter research vector / CMD..."}
               value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") runPrompt();
-              }}
+              onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && runPrompt()}
+              disabled={isSending}
             />
-            <Button onClick={runPrompt} disabled={isSending} className="rounded-sm px-5 uppercase tracking-[0.14em] max-sm:w-full">{isSending ? "Thinking" : "Run Prompt"}</Button>
+            <Button 
+              id="execute-btn"
+              onClick={runPrompt} 
+              disabled={isSending || !prompt.trim()} 
+              className="h-10 rounded-none px-6 font-bold uppercase tracking-widest transition-all"
+            >
+              {isSending ? <span className="flex items-center gap-2"><Zap className="size-3 animate-spin" />Sync</span> : "Execute"}
+            </Button>
           </div>
         </div>
       </div>
-      <DeepDivePanel symbol={symbol} selected={selected} candles={candles} onSymbolChange={setSymbol} dataError={error} />
+      <MemoryPanel
+        memories={memories}
+        memoryDraft={memoryDraft}
+        attachmentTitle={attachmentTitle}
+        attachmentDraft={attachmentDraft}
+        isSaving={isSavingContext}
+        onMemoryDraftChange={setMemoryDraft}
+        onAttachmentTitleChange={setAttachmentTitle}
+        onAttachmentDraftChange={setAttachmentDraft}
+        onSaveMemory={savePinnedMemory}
+        onSaveAttachment={saveAttachment}
+        onTogglePinned={(memory) => updateMemory(memory.id, { pinned: !memory.pinned }).then(refreshMemories)}
+        onDisable={(memory) => updateMemory(memory.id, { enabled: false }).then(refreshMemories)}
+        onDelete={(memory) => deleteMemory(memory.id).then(refreshMemories)}
+      />
+      <DeepDivePanel symbol={symbol} selected={selected} candles={candles} onSymbolChange={(s) => {
+        // Find existing thread or switch symbol of active thread
+        const existing = threads.find(t => t.symbol === s);
+        if (existing) {
+          onSwitchThread(existing.id);
+        } else if (activeThread) {
+          onUpdateThreads(prev => prev.map(t => t.id === activeThreadId ? { ...t, symbol: s, title: `Research: ${s}` } : t));
+        } else {
+          createNewThread(s);
+        }
+      }} dataError={error} />
+    </div>
+  );
+}
+
+function ThreadSidebar({ 
+  threads, 
+  activeId, 
+  onSwitch, 
+  onNew, 
+  onDelete 
+}: { 
+  threads: ChatThread[]; 
+  activeId: string | null; 
+  onSwitch: (id: string) => void; 
+  onNew: (symbol: SymbolKey) => void; 
+  onDelete: (id: string) => void; 
+}) {
+  return (
+    <aside className="flex w-[260px] flex-col border-r border-border bg-[#020202] max-xl:w-full max-xl:h-[180px] max-xl:border-b max-xl:border-r-0">
+      <div className="flex h-[57px] shrink-0 items-center justify-between border-b border-border px-4">
+        <h2 className="label-caps font-bold text-white">Analysis Clusters</h2>
+        <Button variant="ghost" size="icon-sm" onClick={() => onNew("NVDA")} className="hover:bg-primary/10 hover:text-primary">
+          <Plus className="size-4" />
+        </Button>
+      </div>
+      <ScrollArea className="flex-1">
+        <div className="flex flex-col gap-1 p-2 max-xl:flex-row max-xl:overflow-x-auto">
+          {threads.length === 0 ? (
+            <div className="py-10 text-center px-4">
+              <History className="mx-auto size-6 text-muted-foreground opacity-20" />
+              <p className="mt-2 text-[10px] uppercase tracking-tighter text-muted-foreground">No sessions active</p>
+            </div>
+          ) : threads.map((thread) => (
+            <div 
+              key={thread.id}
+              className={cn(
+                "group relative flex items-center justify-between rounded-sm px-3 py-2.5 transition-all cursor-pointer max-xl:min-w-[180px]",
+                activeId === thread.id ? "bg-primary/10 text-white shadow-[inset_4px_0_0_0_hsl(var(--primary))]" : "text-muted-foreground hover:bg-white/5 hover:text-zinc-200"
+              )}
+              onClick={() => onSwitch(thread.id)}
+            >
+              <div className="flex min-w-0 items-center gap-3">
+                <MessageSquare className={cn("size-3.5 shrink-0", activeId === thread.id ? "text-primary" : "text-zinc-600")} />
+                <div className="flex flex-col min-w-0">
+                  <span className="truncate text-xs font-bold uppercase tracking-tight">{thread.title}</span>
+                  <span className="text-[9px] opacity-40 font-data">{new Date(thread.lastActive).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                </div>
+              </div>
+              <Button 
+                variant="ghost" 
+                size="icon-xs" 
+                className="opacity-0 group-hover:opacity-100 hover:text-red-400 transition-opacity"
+                onClick={(e) => { e.stopPropagation(); onDelete(thread.id); }}
+              >
+                <Trash2 className="size-3" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      </ScrollArea>
+    </aside>
+  );
+}
+
+function MemoryPanel({
+  memories,
+  memoryDraft,
+  attachmentTitle,
+  attachmentDraft,
+  isSaving,
+  onMemoryDraftChange,
+  onAttachmentTitleChange,
+  onAttachmentDraftChange,
+  onSaveMemory,
+  onSaveAttachment,
+  onTogglePinned,
+  onDisable,
+  onDelete
+}: {
+  memories: MemoryItem[];
+  memoryDraft: string;
+  attachmentTitle: string;
+  attachmentDraft: string;
+  isSaving: boolean;
+  onMemoryDraftChange: (value: string) => void;
+  onAttachmentTitleChange: (value: string) => void;
+  onAttachmentDraftChange: (value: string) => void;
+  onSaveMemory: () => void;
+  onSaveAttachment: () => void;
+  onTogglePinned: (memory: MemoryItem) => void;
+  onDisable: (memory: MemoryItem) => void;
+  onDelete: (memory: MemoryItem) => void;
+}) {
+  const visibleMemories = memories.filter((memory) => memory.enabled !== false).slice(0, 10);
+  return (
+    <aside className="flex w-[300px] shrink-0 flex-col border-l border-border bg-[#020202] max-2xl:hidden">
+      <div className="flex h-[57px] shrink-0 items-center justify-between border-b border-border px-4">
+        <div>
+          <h2 className="label-caps font-bold text-white">Partner Memory</h2>
+          <p className="mt-1 text-[10px] uppercase tracking-tight text-muted-foreground">Investment context persists</p>
+        </div>
+        <Brain className="size-4 text-primary" />
+      </div>
+      <ScrollArea className="min-h-0 flex-1">
+        <div className="flex flex-col gap-4 p-4">
+          <div className="rounded-sm border border-primary/15 bg-primary/5 p-3">
+            <div className="mb-2 flex items-center gap-2 label-caps text-primary">
+              <Pin className="size-3" />
+              Pin Core Preference
+            </div>
+            <Textarea
+              className="min-h-20 rounded-sm border-border bg-background/80 text-xs"
+              placeholder="Example: I care more about long-term investing, portfolio thesis, and conviction than short-term trades."
+              value={memoryDraft}
+              onChange={(event) => onMemoryDraftChange(event.target.value)}
+            />
+            <Button className="mt-2 h-8 w-full rounded-none text-[10px] uppercase tracking-widest" onClick={onSaveMemory} disabled={isSaving || !memoryDraft.trim()}>
+              Save Memory
+            </Button>
+          </div>
+
+          <div className="rounded-sm border border-border bg-card/40 p-3">
+            <div className="mb-2 flex items-center gap-2 label-caps">
+              <Paperclip className="size-3" />
+              Attach Context
+            </div>
+            <Input
+              className="mb-2 h-8 rounded-sm border-border bg-background/80 text-xs"
+              placeholder="Thesis title"
+              value={attachmentTitle}
+              onChange={(event) => onAttachmentTitleChange(event.target.value)}
+            />
+            <Textarea
+              className="min-h-24 rounded-sm border-border bg-background/80 text-xs"
+              placeholder="Paste research, thesis notes, earnings notes, or portfolio context for this symbol."
+              value={attachmentDraft}
+              onChange={(event) => onAttachmentDraftChange(event.target.value)}
+            />
+            <Button variant="outline" className="mt-2 h-8 w-full rounded-none text-[10px] uppercase tracking-widest" onClick={onSaveAttachment} disabled={isSaving || !attachmentDraft.trim()}>
+              Attach To Cluster
+            </Button>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <div className="label-caps">Active Recall</div>
+            {visibleMemories.length === 0 ? (
+              <div className="rounded-sm border border-border p-3 text-xs text-muted-foreground">No memory loaded yet.</div>
+            ) : visibleMemories.map((memory) => (
+              <div key={memory.id} className="rounded-sm border border-border bg-background/50 p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <Badge variant="outline" className="rounded-none text-[9px] uppercase">{memory.category.replace(/_/g, " ")}</Badge>
+                  <div className="flex items-center gap-1">
+                    <Button variant="ghost" size="icon-xs" onClick={() => onTogglePinned(memory)} title={memory.pinned ? "Unpin memory" : "Pin memory"}>
+                      <Pin className={cn("size-3", memory.pinned && "text-primary")} />
+                    </Button>
+                    <Button variant="ghost" size="icon-xs" onClick={() => onDisable(memory)} title="Disable memory">
+                      <X className="size-3" />
+                    </Button>
+                    {memory.source !== "system_seed" && (
+                      <Button variant="ghost" size="icon-xs" onClick={() => onDelete(memory)} title="Delete memory">
+                        <Trash2 className="size-3" />
+                      </Button>
+                    )}
+                  </div>
+                </div>
+                <p className="line-clamp-4 text-xs leading-5 text-zinc-300">{memory.content}</p>
+                <div className="mt-2 font-data text-[9px] uppercase text-muted-foreground">{memory.symbol} / {memory.source.replace(/_/g, " ")}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </ScrollArea>
+    </aside>
+  );
+}
+
+function ChatModeBar({ mode, onModeChange }: { mode: string; onModeChange: (mode: string) => void }) {
+  const modes = ["Long-Term Investor", "Portfolio Brain", "Thesis Review", "Earnings Review", "Risk Check", "News Impact", "Buy More / Hold / Trim", "Trade Setup"];
+  return (
+    <div className="rounded-sm border border-border bg-card/30 p-2">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="label-caps">Research Mode</div>
+        <Badge variant="outline" className="rounded-none text-[10px]">{mode}</Badge>
+      </div>
+      <ToggleGroup type="single" value={mode} onValueChange={(value) => value && onModeChange(value)} className="flex flex-wrap justify-start gap-2">
+        {modes.map((item) => (
+          <ToggleGroupItem key={item} value={item} className="h-7 rounded-sm px-2 font-data text-[10px] uppercase tracking-tight">
+            {item}
+          </ToggleGroupItem>
+        ))}
+      </ToggleGroup>
     </div>
   );
 }
@@ -1304,7 +2037,17 @@ function DeepDivePanel({ symbol, selected, candles, onSymbolChange, dataError }:
   );
 }
 
-function JournalPage({ rows, onAddTrade, watchlist }: { rows: AuditRow[]; onAddTrade: (row: AuditRow) => void; watchlist: WatchSymbol[] }) {
+function JournalPage({
+  rows,
+  onAddTrade,
+  onUpdateTrade,
+  watchlist
+}: {
+  rows: AuditRow[];
+  onAddTrade: (row: AuditRow) => void;
+  onUpdateTrade: (index: number, row: AuditRow) => void;
+  watchlist: WatchSymbol[];
+}) {
   const [showTradeForm, setShowTradeForm] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [draft, setDraft] = useState({
@@ -1350,9 +2093,7 @@ function JournalPage({ rows, onAddTrade, watchlist }: { rows: AuditRow[]; onAddT
     if (editingIndex === null) {
       onAddTrade(nextRow);
     } else {
-      // For now, update just updates local state or you can implement PUT
-      // onRowsChange(rows.map((row, index) => index === editingIndex ? nextRow : row));
-      onAddTrade(nextRow); // Fallback to add for demo/logic simplicity if needed
+      onUpdateTrade(editingIndex, nextRow);
     }
     setShowTradeForm(false);
     resetDraft();
@@ -1445,19 +2186,35 @@ function JournalPage({ rows, onAddTrade, watchlist }: { rows: AuditRow[]; onAddT
 
 
 
-function PortfolioPage({ rows, onAddHolding, watchlist }: { rows: Holding[]; onAddHolding: (holding: Omit<Holding, "id">) => void; watchlist: WatchSymbol[] }) {
+function PortfolioPage({ rows, onAddHolding, onUpdateHolding, watchlist }: { rows: Holding[]; onAddHolding: (holding: Omit<Holding, "id">) => void; onUpdateHolding: (id: string, patch: Partial<Holding>) => void; watchlist: WatchSymbol[] }) {
   const [showForm, setShowForm] = useState(false);
-  const [draft, setDraft] = useState({ symbol: "NVDA" as SymbolKey, shares: 100, averageCost: 850.42 });
+  const [draft, setDraft] = useState<Omit<Holding, "id">>({
+    symbol: "NVDA",
+    shares: 100,
+    averageCost: 850.42,
+    conviction: "core",
+    timeHorizon: "long-term",
+    thesis: "",
+    invalidation: "",
+    riskNotes: ""
+  });
 
   const holdings = useMemo(() => rows.map((holding) => {
     const quote = watchlist.find((item) => item.symbol === holding.symbol) ?? watchlist[0];
     const value = holding.shares * quote.last;
     const pnl = value - holding.shares * holding.averageCost;
-    return { ...holding, last: quote.last, value, pnl };
+    const pnlPercent = holding.averageCost ? ((quote.last - holding.averageCost) / holding.averageCost) * 100 : 0;
+    return { ...holding, last: quote.last, value, pnl, pnlPercent };
   }), [rows, watchlist]);
 
   const total = holdings.reduce((sum, row) => sum + row.value, 0);
+  const invested = holdings.reduce((sum, row) => sum + row.shares * row.averageCost, 0);
   const pnl = holdings.reduce((sum, row) => sum + row.pnl, 0);
+  const cashBuffer = Math.max(total * 0.18, 2500);
+  const totalBalance = total + cashBuffer;
+  const portfolioReturn = invested ? (pnl / invested) * 100 : 0;
+  const thesisCoverage = holdings.length ? Math.round((holdings.filter((row) => row.thesis?.trim()).length / holdings.length) * 100) : 0;
+  const chartSeries = useMemo(() => buildPortfolioSeries(total || invested || 1), [invested, total]);
 
   const saveHolding = () => {
     onAddHolding(draft);
@@ -1465,66 +2222,454 @@ function PortfolioPage({ rows, onAddHolding, watchlist }: { rows: Holding[]; onA
   };
 
   return (
-    <div className="grid min-h-full gap-4 overflow-auto p-4 xl:h-full xl:grid-rows-[140px_minmax(0,1fr)] xl:overflow-hidden max-md:p-3">
-      <div className="grid grid-cols-4 gap-4 max-xl:grid-cols-2 max-sm:grid-cols-1">
-        <KpiCard title="Portfolio Equity" value={currency(total)} meta="+2.18%" details={[["Holdings", String(holdings.length)], ["Cash Buffer", "18.4%"]]} accent="primary" />
-        <KpiCard title="Open P&L" value={currency(pnl)} meta="Unrealized" details={[["Best", "NVDA"], ["Worst", "AAPL"]]} accent="green" />
-        <KpiCard title="Exposure" value="72.6%" meta="Allocated" details={[["Tech", "64%"], ["Index", "18%"]]} />
-        <KpiCard title="Risk Budget" value="0.84R" meta="Nominal" details={[["VAR", "$2,410"], ["Heat", "Low"]]} />
+    <div className="flex h-full flex-col gap-6 p-6 overflow-auto bg-background">
+      <Dialog open={showForm} onOpenChange={setShowForm}>
+        <DialogContent className="max-w-2xl bg-background border-border">
+          <DialogHeader>
+            <DialogTitle className="text-xl font-bold">Initialize New Holding</DialogTitle>
+            <DialogDescription className="label-caps opacity-60">Add an asset to your core portfolio ledger</DialogDescription>
+          </DialogHeader>
+          <div className="grid grid-cols-2 gap-4 py-4">
+             <div className="flex flex-col gap-2">
+                <span className="label-caps opacity-60">Ticker Symbol</span>
+                <Select value={draft.symbol} onValueChange={(val) => setDraft({ ...draft, symbol: val as SymbolKey })}>
+                   <SelectTrigger className="font-data"><SelectValue /></SelectTrigger>
+                   <SelectContent>{watchlist.map(i => <SelectItem key={i.symbol} value={i.symbol}>{i.symbol}</SelectItem>)}</SelectContent>
+                </Select>
+             </div>
+             <div className="flex flex-col gap-2">
+                <span className="label-caps opacity-60">Shares / Quantity</span>
+                <Input type="number" className="font-data" value={draft.shares} onChange={e => setDraft({...draft, shares: Number(e.target.value)})} />
+             </div>
+             <div className="flex flex-col gap-2">
+                <span className="label-caps opacity-60">Average Entry Price</span>
+                <Input type="number" className="font-data" value={draft.averageCost} onChange={e => setDraft({...draft, averageCost: Number(e.target.value)})} />
+             </div>
+             <div className="flex flex-col gap-2">
+                <span className="label-caps opacity-60">Conviction Tier</span>
+                <Select value={draft.conviction} onValueChange={(val) => setDraft({ ...draft, conviction: val as any })}>
+                   <SelectTrigger className="font-data"><SelectValue /></SelectTrigger>
+                   <SelectContent>
+                      {["watch", "starter", "core", "high"].map(c => <SelectItem key={c} value={c}>{c.toUpperCase()}</SelectItem>)}
+                   </SelectContent>
+                </Select>
+             </div>
+             <div className="col-span-2 flex flex-col gap-2">
+                <span className="label-caps opacity-60">Investment Thesis</span>
+                <Textarea className="min-h-20 font-data text-xs" value={draft.thesis} onChange={e => setDraft({...draft, thesis: e.target.value})} placeholder="Why are you taking this position?" />
+             </div>
+          </div>
+          <DialogFooter>
+             <Button variant="outline" onClick={() => setShowForm(false)}>Cancel</Button>
+             <Button onClick={saveHolding} className="px-8 font-bold uppercase tracking-wider">Commit to Ledger</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Overview Intelligence */}
+      <div className="grid grid-cols-1 xl:grid-cols-[440px_minmax(0,1fr)] gap-6">
+        <PortfolioOverviewCard totalBalance={totalBalance} invested={invested} available={cashBuffer} pnl={pnl} returnPercent={portfolioReturn} thesisCoverage={thesisCoverage} />
+        <MarketStrip watchlist={watchlist} />
       </div>
 
-      {showForm ? (
-        <Panel className="p-4">
-          <PanelTitle title="Add New Holding" action={<Button variant="ghost" size="sm" onClick={() => setShowForm(false)}>Cancel</Button>} />
-          <div className="mt-4 grid grid-cols-4 gap-4 max-sm:grid-cols-1">
-            <div>
-              <div className="mb-2 label-caps">Symbol</div>
-              <Select value={draft.symbol} onValueChange={(val) => setDraft({ ...draft, symbol: val as SymbolKey })}>
-                <SelectTrigger className="h-10 w-full rounded-sm border-border bg-background font-data">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {watchlist.map((item) => <SelectItem key={item.symbol} value={item.symbol}>{item.symbol}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
-            <TradeField label="Shares" value={String(draft.shares)} onChange={(val) => setDraft({ ...draft, shares: Number(val) })} />
-            <TradeField label="Avg Cost" value={String(draft.averageCost)} onChange={(val) => setDraft({ ...draft, averageCost: Number(val) })} />
-            <div className="flex items-end">
-              <Button onClick={saveHolding} className="h-10 w-full rounded-sm font-bold uppercase tracking-widest">Add to Portfolio</Button>
+      {/* Main Analytics Row */}
+      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px] gap-6">
+        <div className="flex flex-col gap-6 min-h-0">
+          <Card className="flex-1 flex flex-col min-h-[480px]">
+            <CardHeader className="flex flex-row items-center justify-between border-b pb-4">
+              <div className="flex flex-col gap-1">
+                <CardTitle className="text-xl font-bold">Equity Intelligence</CardTitle>
+                <CardDescription className="font-data text-xs uppercase tracking-wider">Total Value: {currency(totalBalance)}</CardDescription>
+              </div>
+              <Tabs defaultValue="year" className="w-[320px]">
+                <TabsList className="grid w-full grid-cols-5">
+                  <TabsTrigger value="day">Day</TabsTrigger>
+                  <TabsTrigger value="week">Week</TabsTrigger>
+                  <TabsTrigger value="month">Month</TabsTrigger>
+                  <TabsTrigger value="year">Year</TabsTrigger>
+                  <TabsTrigger value="all">All</TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </CardHeader>
+            <CardContent className="flex-1 p-6 flex flex-col">
+              <PortfolioPerformanceChart total={total} pnl={pnl} series={chartSeries} />
+            </CardContent>
+          </Card>
+
+          <Card className="min-h-0">
+            <CardHeader className="flex flex-row items-center justify-between border-b pb-4">
+              <CardTitle>Active Ledger</CardTitle>
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => setShowForm(true)}><Plus data-icon="inline-start" />Add Position</Button>
+                <Button variant="outline" size="sm"><Download data-icon="inline-start" />Export</Button>
+              </div>
+            </CardHeader>
+            <CardContent className="p-0">
+              <PortfolioAssetList holdings={holdings} watchlist={watchlist} onUpdateHolding={onUpdateHolding} />
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="flex flex-col gap-6">
+          <Card>
+            <CardHeader className="border-b">
+              <CardTitle>Portfolio Brain</CardTitle>
+              <CardDescription>Durable investment thesis context</CardDescription>
+            </CardHeader>
+            <CardContent className="p-4 flex flex-col gap-4">
+              {holdings.map((row) => (
+                <ThesisCard key={row.id} holding={row} onUpdate={(patch) => onUpdateHolding(row.id, patch)} />
+              ))}
+            </CardContent>
+          </Card>
+          
+          <Card>
+            <CardHeader className="border-b">
+              <CardTitle>Allocation Distribution</CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 flex flex-col gap-4">
+               {holdings.map((row) => {
+                const pct = total ? Math.round((row.value / total) * 100) : 0;
+                return <AllocationRow key={row.id} symbol={row.symbol} pct={pct} value={row.value} />;
+              })}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PortfolioOverviewCard({ totalBalance, invested, available, pnl, returnPercent, thesisCoverage }: { totalBalance: number; invested: number; available: number; pnl: number; returnPercent: number; thesisCoverage: number }) {
+  const placedPct = totalBalance ? Math.round((invested / totalBalance) * 100) : 0;
+  return (
+    <Card className="p-6">
+      <div className="mb-6 flex items-center justify-between">
+        <h2 className="text-2xl font-bold tracking-tight">Overview</h2>
+        <Badge variant={returnPercent >= 0 ? "secondary" : "destructive"}>{signed(returnPercent, "%")}</Badge>
+      </div>
+      <div className="grid grid-cols-2 gap-8">
+        <div className="flex flex-col gap-4">
+          <div className="label-caps opacity-60">Total Balance</div>
+          <div className="font-data text-3xl font-black text-white">{currency(totalBalance)}</div>
+          <div className="relative mt-2 flex size-32 items-center justify-center self-center">
+            <svg className="size-full -rotate-90 transform" viewBox="0 0 100 100">
+              <circle cx="50" cy="50" r="40" stroke="currentColor" strokeWidth="8" fill="transparent" className="text-muted/20" />
+              <circle cx="50" cy="50" r="40" stroke="currentColor" strokeWidth="8" fill="transparent" strokeDasharray={`${placedPct * 2.51} 251`} className="text-primary transition-all duration-1000 ease-in-out" strokeLinecap="round" />
+            </svg>
+            <div className="absolute inset-0 flex flex-col items-center justify-center">
+              <span className="font-data text-xl font-bold">{placedPct}%</span>
+              <span className="label-caps text-[8px] opacity-60">Placed</span>
             </div>
           </div>
-        </Panel>
-      ) : null}
+          <div className="grid grid-cols-2 gap-2 mt-4">
+            <div className="flex flex-col gap-1 border-r pr-2">
+              <span className="label-caps text-[9px] opacity-60">Placed</span>
+              <span className="font-data text-xs font-bold">{currency(invested)}</span>
+            </div>
+            <div className="flex flex-col gap-1 pl-2">
+              <span className="label-caps text-[9px] opacity-60">Available</span>
+              <span className="font-data text-xs font-bold">{currency(available)}</span>
+            </div>
+          </div>
+        </div>
 
-      <div className="grid min-h-0 grid-cols-[minmax(0,1fr)_340px] gap-4 max-xl:grid-cols-1">
-        <Panel className="min-h-0">
-          <PanelTitle title="portfolio_positions.json" action={<div className="flex gap-2"><Button variant="outline" size="sm" onClick={() => setShowForm(true)}><Plus className="mr-1 size-3" />Add Holding</Button><Button variant="outline" size="sm"><Download data-icon="inline-start" />Export</Button></div>} />
-          <Table>
-            <TableHeader><TableRow><TableHead>Ticker</TableHead><TableHead>Name</TableHead><TableHead className="text-right">Qty</TableHead><TableHead className="text-right">Avg Entry</TableHead><TableHead className="text-right">Mark</TableHead><TableHead className="text-right">Market Value</TableHead><TableHead className="text-right">P&L</TableHead></TableRow></TableHeader>
-            <TableBody>{holdings.map((row) => <TableRow key={row.id}><TableCell className="font-data font-bold text-primary">{row.symbol}</TableCell><TableCell className="text-muted-foreground">{watchlist.find((item) => item.symbol === row.symbol)?.name}</TableCell><TableCell className="text-right font-data">{number(row.shares)}</TableCell><TableCell className="text-right font-data">{currency(row.averageCost)}</TableCell><TableCell className="text-right font-data">{currency(row.last)}</TableCell><TableCell className="text-right font-data">{currency(row.value)}</TableCell><TableCell className={cn("text-right font-data font-bold", row.pnl >= 0 ? "text-emerald-300" : "text-red-200")}>{currency(row.pnl)}</TableCell></TableRow>)}</TableBody>
-          </Table>
-        </Panel>
-        <Panel>
-          <PanelTitle title="Allocation Matrix" />
-          <div className="flex flex-col gap-5 p-5">
-            {holdings.map((row) => {
-              const pct = total ? Math.round((row.value / total) * 100) : 0;
-              return (
-                <div key={row.id}>
-                  <div className="mb-2 flex justify-between font-data text-sm"><span className="text-white">{row.symbol}</span><span className="text-primary">{pct}%</span></div>
-                  <div className="h-2 bg-muted"><div className="h-full bg-primary" style={{ width: `${pct}%` }} /></div>
+        <div className="flex flex-col gap-4">
+          <div className="label-caps opacity-60">Past Month</div>
+          <div className="font-data text-3xl font-black text-white">{currency(Math.abs(pnl))}</div>
+          <div className="relative mt-2 flex size-32 items-center justify-center self-center">
+            <svg className="size-full -rotate-90 transform" viewBox="0 0 100 100">
+              <circle cx="50" cy="50" r="40" stroke="currentColor" strokeWidth="8" fill="transparent" className="text-muted/20" />
+              <circle cx="50" cy="50" r="40" stroke="currentColor" strokeWidth="8" fill="transparent" strokeDasharray={`${thesisCoverage * 2.51} 251`} className="text-emerald-500 transition-all duration-1000 ease-in-out" strokeLinecap="round" />
+            </svg>
+            <div className="absolute inset-0 flex flex-col items-center justify-center">
+              <span className="font-data text-xl font-bold">{thesisCoverage}%</span>
+              <span className="label-caps text-[8px] opacity-60">Thesis</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2 mt-4">
+            <div className="flex flex-col gap-1 border-r pr-2">
+              <span className="label-caps text-[9px] opacity-60">Overall</span>
+              <span className="font-data text-xs font-bold text-emerald-400">{signed(returnPercent, "%")}</span>
+            </div>
+            <div className="flex flex-col gap-1 pl-2">
+              <span className="label-caps text-[9px] opacity-60">Portfolio</span>
+              <span className="font-data text-xs font-bold">{thesisCoverage}%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function MarketStrip({ watchlist }: { watchlist: WatchSymbol[] }) {
+  return (
+    <Card className="overflow-hidden">
+      <CardHeader className="flex flex-row items-center justify-between border-b py-4">
+        <CardTitle className="text-lg">Current Market</CardTitle>
+        <Badge variant="outline" className="rounded-none text-[9px] tracking-widest uppercase">Live Pulse</Badge>
+      </CardHeader>
+      <ScrollArea className="w-full">
+        <div className="flex p-4 gap-4">
+          {watchlist.slice(0, 8).map((item) => (
+            <Card key={item.symbol} className="min-w-[200px] bg-background/50 border-border/50 transition-all hover:border-primary/40">
+              <CardContent className="p-4 flex flex-col gap-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col">
+                    <span className="font-data text-sm font-bold text-white uppercase">{item.symbol}</span>
+                    <span className="text-[10px] text-muted-foreground truncate max-w-[100px]">{item.name}</span>
+                  </div>
+                  <Badge variant={item.changePercent >= 0 ? "secondary" : "destructive"} className="rounded-none text-[9px] font-data">
+                    {signed(item.changePercent, "%")}
+                  </Badge>
                 </div>
-              );
-            })}
-            <div className="mt-4 border border-border bg-background p-4">
-              <div className="label-caps">Correlation Guard</div>
-              <div className="mt-3 font-data text-3xl text-white">0.71</div>
-              <Slider value={[71]} max={100} disabled className="mt-5" />
-            </div>
+                <div className="h-10 flex items-end">
+                   <MiniLine positive={item.changePercent >= 0} seed={item.symbol.length + Math.round(Math.abs(item.changePercent) * 10)} />
+                </div>
+                <div className="flex gap-2">
+                  <Button variant="outline" size="sm" className="h-7 flex-1 text-[10px] uppercase font-bold tracking-tight">Short</Button>
+                  <Button variant="secondary" size="sm" className="h-7 flex-1 text-[10px] uppercase font-bold tracking-tight">Buy</Button>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+        <ScrollBar orientation="horizontal" />
+      </ScrollArea>
+    </Card>
+  );
+}
+
+function PortfolioPerformanceChart({ total, pnl, series }: { total: number; pnl: number; series: Array<{ label: string; value: number }> }) {
+  const width = 640;
+  const height = 240;
+  const values = series.map((point) => point.value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = Math.max(1, max - min);
+  const points = series.map((point, index) => {
+    const x = (index / Math.max(1, series.length - 1)) * width;
+    const y = height - ((point.value - min) / range) * (height - 40) - 20;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const area = `0,${height} ${points} ${width},${height}`;
+
+  return (
+    <div className="flex-1 flex flex-col gap-6">
+       <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-1">
+            <span className="label-caps opacity-60">Total Investments</span>
+            <div className="font-data text-2xl font-black text-white">{currency(total)}</div>
           </div>
-        </Panel>
+          <div className="flex items-center gap-4 text-right">
+             <div className="flex flex-col gap-1">
+               <span className="label-caps opacity-60 text-right">Unrealized P&L</span>
+               <div className={cn("font-data text-xl font-bold", pnl >= 0 ? "text-emerald-400" : "text-red-400")}>
+                 {signed(pnl / (total - pnl) * 100, "%")}
+               </div>
+             </div>
+          </div>
+       </div>
+       <div className="flex-1 min-h-0 relative">
+          <svg viewBox={`0 0 ${width} ${height}`} className="h-full w-full overflow-visible" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="hsl(var(--primary))" stopOpacity="0.3" />
+                <stop offset="100%" stopColor="hsl(var(--primary))" stopOpacity="0" />
+              </linearGradient>
+            </defs>
+            {[0.25, 0.5, 0.75].map((tick) => (
+              <line key={tick} x1="0" x2={width} y1={height * tick} y2={height * tick} className="stroke-border/40" strokeDasharray="4 4" />
+            ))}
+            <polygon points={area} fill="url(#chartGradient)" />
+            <polyline points={points} fill="none" className="stroke-primary" strokeWidth="4" strokeLinejoin="round" strokeLinecap="round" />
+          </svg>
+       </div>
+    </div>
+  );
+}
+
+function PortfolioAssetList({ holdings, watchlist, onUpdateHolding }: { holdings: Array<Holding & { last: number; value: number; pnl: number; pnlPercent: number }>; watchlist: WatchSymbol[]; onUpdateHolding: (id: string, patch: Partial<Holding>) => void }) {
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex items-center justify-between p-4 border-b">
+         <div className="flex items-center gap-2">
+            <Select defaultValue="stocks">
+              <SelectTrigger className="h-8 w-32 rounded-none bg-background/50 font-data text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent><SelectItem value="stocks">Stocks</SelectItem><SelectItem value="all">Total Alpha</SelectItem></SelectContent>
+            </Select>
+         </div>
+         <div className="flex items-center gap-1">
+            <Button variant="ghost" size="icon-xs"><Search className="size-3" /></Button>
+            <Button variant="ghost" size="icon-xs"><Filter className="size-3" /></Button>
+         </div>
       </div>
+      <ScrollArea className="flex-1">
+        <Table>
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="w-[60px] pl-4">Asset</TableHead>
+              <TableHead>Ticker</TableHead>
+              <TableHead className="text-right">Quantity</TableHead>
+              <TableHead className="text-right">Price</TableHead>
+              <TableHead className="text-right">Value</TableHead>
+              <TableHead className="text-right pr-4">PnL</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {holdings.map((row) => (
+              <TableRow key={row.id} className="group border-b/40">
+                <TableCell className="pl-4">
+                  <div className="flex size-10 items-center justify-center rounded-full bg-muted/40 font-data text-[10px] font-black group-hover:bg-primary/20 transition-colors">
+                    {row.symbol.slice(0, 2)}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="flex flex-col">
+                    <span className="font-data font-bold text-white">{row.symbol}</span>
+                    <span className="text-[10px] text-muted-foreground uppercase">{row.conviction}</span>
+                  </div>
+                </TableCell>
+                <TableCell className="text-right font-data text-xs">{number(row.shares)}</TableCell>
+                <TableCell className="text-right font-data text-xs">{currency(row.last)}</TableCell>
+                <TableCell className="text-right font-data text-sm font-bold text-white">{currency(row.value)}</TableCell>
+                <TableCell className="text-right pr-4">
+                   <div className="flex flex-col items-end">
+                      <span className={cn("font-data text-xs font-bold", row.pnl >= 0 ? "text-emerald-400" : "text-red-400")}>
+                        {signed(row.pnlPercent, "%")}
+                      </span>
+                      <Button variant="ghost" className="h-4 p-0 text-[9px] uppercase opacity-0 group-hover:opacity-100 transition-opacity" onClick={() => onUpdateHolding(row.id, { shares: 0 })}>Exit</Button>
+                   </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </ScrollArea>
+    </div>
+  );
+}
+
+function AllocationRow({ symbol, pct, value }: { symbol: SymbolKey; pct: number; value: number }) {
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex justify-between items-center font-data text-[11px]">
+        <span className="text-white font-bold">{symbol}</span>
+        <span className="text-muted-foreground">{pct}% • {currency(value)}</span>
+      </div>
+      <div className="h-1.5 w-full bg-muted/30 rounded-full overflow-hidden">
+        <div className="h-full bg-primary transition-all duration-700" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function ReviewQueue({ holdings }: { holdings: Array<Holding & { last: number; value: number; pnl: number; pnlPercent: number }> }) {
+  const needsReview = holdings.filter((row) => !row.thesis || !row.invalidation);
+  if (!needsReview.length) return null;
+
+  return (
+    <Card className="bg-primary/5 border-primary/20">
+      <CardHeader className="p-4 pb-2">
+        <CardTitle className="text-xs uppercase tracking-tighter text-primary">Critical Review Queue</CardTitle>
+      </CardHeader>
+      <CardContent className="p-4 pt-0 flex flex-col gap-2">
+        {needsReview.slice(0, 3).map((row) => (
+          <div key={row.id} className="flex items-center justify-between gap-3 p-2 bg-background/40 border border-border/40">
+             <span className="font-data text-[11px] font-bold">{row.symbol}</span>
+             <Badge variant="outline" className="text-[9px] border-primary/20 text-primary uppercase">No Thesis</Badge>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+function MiniLine({ positive, seed }: { positive: boolean; seed: number }) {
+  const points = Array.from({ length: 14 }, (_, index) => {
+    const x = index * 7;
+    const y = 18 + Math.sin(index * 0.9 + seed) * 5 + (positive ? -index * 0.3 : index * 0.25);
+    return `${x},${y.toFixed(1)}`;
+  }).join(" ");
+  return <svg viewBox="0 0 92 34" className="mt-2 h-8 w-full"><polyline points={points} fill="none" className={positive ? "stroke-primary" : "stroke-destructive"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>;
+}
+
+function buildPortfolioSeries(total: number) {
+  const labels = ["Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May"];
+  return labels.map((label, index) => {
+    const wave = Math.sin(index * 0.9) * 0.16;
+    const climb = 0.62 + index * 0.045;
+    return { label, value: Math.max(1, total * (climb + wave)) };
+  });
+}
+
+function ThesisCard({ holding, onUpdate }: { holding: Holding & { last: number; value: number; pnl: number; pnlPercent: number }; onUpdate: (patch: Partial<Holding>) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState({
+    thesis: holding.thesis ?? "",
+    invalidation: holding.invalidation ?? "",
+    riskNotes: holding.riskNotes ?? "",
+    buyMoreAt: String(holding.buyMoreAt ?? ""),
+    trimAt: String(holding.trimAt ?? "")
+  });
+
+  useEffect(() => {
+    setDraft({
+      thesis: holding.thesis ?? "",
+      invalidation: holding.invalidation ?? "",
+      riskNotes: holding.riskNotes ?? "",
+      buyMoreAt: String(holding.buyMoreAt ?? ""),
+      trimAt: String(holding.trimAt ?? "")
+    });
+  }, [holding.id, holding.thesis, holding.invalidation, holding.riskNotes, holding.buyMoreAt, holding.trimAt]);
+
+  const save = () => {
+    onUpdate({
+      thesis: draft.thesis,
+      invalidation: draft.invalidation,
+      riskNotes: draft.riskNotes,
+      buyMoreAt: Number(draft.buyMoreAt) || undefined,
+      trimAt: Number(draft.trimAt) || undefined
+    });
+    setEditing(false);
+  };
+
+  return (
+    <div className="rounded-sm border border-border bg-background/60 p-4">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <div className="font-data text-lg font-black text-white">{holding.symbol}</div>
+          <div className="mt-1 label-caps">{holding.timeHorizon ?? "long-term"} / {holding.conviction ?? "watch"}</div>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => editing ? save() : setEditing(true)}>{editing ? "Save" : "Edit"}</Button>
+      </div>
+      {editing ? (
+        <div className="flex flex-col gap-3">
+          <Textarea className="min-h-20 rounded-sm border-border bg-card font-data text-xs" value={draft.thesis} onChange={(event) => setDraft({ ...draft, thesis: event.target.value })} placeholder="Core bull thesis" />
+          <Textarea className="min-h-16 rounded-sm border-border bg-card font-data text-xs" value={draft.invalidation} onChange={(event) => setDraft({ ...draft, invalidation: event.target.value })} placeholder="What breaks the thesis" />
+          <Textarea className="min-h-16 rounded-sm border-border bg-card font-data text-xs" value={draft.riskNotes} onChange={(event) => setDraft({ ...draft, riskNotes: event.target.value })} placeholder="Risk notes" />
+          <div className="grid grid-cols-2 gap-2">
+            <Input className="h-9 rounded-sm border-border bg-card font-data text-xs" value={draft.buyMoreAt} onChange={(event) => setDraft({ ...draft, buyMoreAt: event.target.value })} placeholder="Buy more at" />
+            <Input className="h-9 rounded-sm border-border bg-card font-data text-xs" value={draft.trimAt} onChange={(event) => setDraft({ ...draft, trimAt: event.target.value })} placeholder="Trim at" />
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          <div>
+            <div className="label-caps">Core Thesis</div>
+            <p className="mt-1 text-xs leading-5 text-zinc-300">{holding.thesis || "No thesis written yet."}</p>
+          </div>
+          <div>
+            <div className="label-caps">Invalidation</div>
+            <p className="mt-1 text-xs leading-5 text-zinc-300">{holding.invalidation || "No invalidation point set."}</p>
+          </div>
+          <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 font-data text-xs">
+            <div><span className="text-muted-foreground">Buy more </span>{holding.buyMoreAt ? currency(holding.buyMoreAt) : "Unset"}</div>
+            <div><span className="text-muted-foreground">Trim </span>{holding.trimAt ? currency(holding.trimAt) : "Unset"}</div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1577,7 +2722,10 @@ function AuditTable({ compact = false, rows = [], onEdit }: { compact?: boolean;
   return (
     <Table>
       <TableHeader><TableRow><TableHead>Timestamp</TableHead><TableHead>Ticker</TableHead><TableHead>Side</TableHead><TableHead>Price</TableHead><TableHead>Duration</TableHead><TableHead>R:R</TableHead><TableHead>Tag</TableHead><TableHead className="text-right">P&L</TableHead>{!compact ? <TableHead>Audit_Notes</TableHead> : null}{onEdit ? <TableHead className="text-right">Edit</TableHead> : null}</TableRow></TableHeader>
-      <TableBody>{rows.slice(0, compact ? 3 : 12).map((r, index) => <TableRow key={`${r[0]}-${r[1]}-${r[6]}`}>{r.slice(0, compact ? 8 : 9).map((cell, i) => <TableCell key={`${r[0]}-${i}`} className={cn("font-data", i === 1 && "font-bold text-primary", i === 2 && (cell === "BUY" ? "text-emerald-400" : "text-red-200"), i === 7 && (cell.startsWith("+") ? "font-bold text-emerald-300" : cell.startsWith("-") ? "font-bold text-red-200" : ""), i === 8 && "italic text-muted-foreground")}>{i === 6 ? <Badge variant="secondary" className="rounded-sm font-data">{cell}</Badge> : cell}</TableCell>)}{onEdit ? <TableCell className="text-right"><Button variant="ghost" size="sm" onClick={() => onEdit(r, index)}>Edit</Button></TableCell> : null}</TableRow>)}</TableBody>
+      <TableBody>{rows.slice(0, compact ? 3 : 12).map((r, index) => <TableRow key={`${r[0]}-${r[1]}-${r[6]}`}>{r.slice(0, compact ? 8 : 9).map((cell, i) => {
+        const value = String(cell ?? "");
+        return <TableCell key={`${r[0]}-${i}`} className={cn("font-data", i === 1 && "font-bold text-primary", i === 2 && (value === "BUY" ? "text-emerald-400" : "text-red-200"), i === 7 && (value.startsWith("+") ? "font-bold text-emerald-300" : value.startsWith("-") ? "font-bold text-red-200" : ""), i === 8 && "italic text-muted-foreground")}>{i === 6 ? <Badge variant="secondary" className="rounded-sm font-data">{value}</Badge> : value}</TableCell>;
+      })}{onEdit ? <TableCell className="text-right"><Button variant="ghost" size="sm" onClick={() => onEdit(r, index)}>Edit</Button></TableCell> : null}</TableRow>)}</TableBody>
     </Table>
   );
 }

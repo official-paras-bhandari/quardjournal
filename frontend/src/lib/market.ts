@@ -1,4 +1,5 @@
 import type { Candle, NewsItem, SymbolKey, WatchSymbol } from "./types";
+import { authFetch, authenticatedStreamUrl } from "./auth";
 
 export type MarketQuote = Pick<WatchSymbol, "symbol" | "last" | "change" | "changePercent"> & {
   open: number;
@@ -10,7 +11,7 @@ export type MarketQuote = Pick<WatchSymbol, "symbol" | "last" | "change" | "chan
 };
 
 async function readJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+  const response = await authFetch(url);
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.error ?? `Request failed with ${response.status}`);
@@ -31,5 +32,5 @@ export function getMarketCandles(symbol: SymbolKey, resolution = "D") {
 }
 
 export function marketStreamUrl(symbol: SymbolKey) {
-  return `/api/markets/stream?symbol=${encodeURIComponent(symbol)}`;
+  return authenticatedStreamUrl(`/api/markets/stream?symbol=${encodeURIComponent(symbol)}`);
 }

@@ -292,9 +292,15 @@ export function TechnicalChart({
             {selectedQuote.changePercent >= 0 ? "Bid Holding" : "Supply Active"}
           </Badge>
           <ToggleGroup type="single" value={resolution} onValueChange={(value) => value && onResolutionChange(value)} className="rounded-none">
-            {["1", "5", "15", "60", "D"].map((item) => (
-              <ToggleGroupItem key={item} value={item} className="rounded-sm font-data text-xs">
-                {item === "60" ? "1H" : item === "D" ? "D" : `${item}m`}
+            {["1", "5", "15", "60", "D", "M", "12M", "60M", "MAX"].map((item) => (
+              <ToggleGroupItem key={item} value={item} className="rounded-sm font-data text-xs uppercase">
+                {item === "60" ? "1H" : 
+                 item === "D" ? "1D" : 
+                 item === "M" ? "1M" : 
+                 item === "12M" ? "1Y" : 
+                 item === "60M" ? "5Y" : 
+                 item === "MAX" ? "MAX" : 
+                 `${item}m`}
               </ToggleGroupItem>
             ))}
           </ToggleGroup>

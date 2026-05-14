@@ -1,9 +1,24 @@
 generator client {
   provider = "prisma-client-js"
+  engineType = "library"
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
+}
+
+model PortfolioHolding {
+  id           String   @id @default(uuid())
+  symbol       String
+  shares       Float
+  averageCost  Float
+  conviction   String   @default("core")
+  timeHorizon  String   @default("long-term")
+  thesis       String   @default("")
+  invalidation String   @default("")
+  riskNotes    String   @default("")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
 model JournalEntry {
@@ -20,27 +35,32 @@ model JournalEntry {
   createdAt DateTime @default(now())
 }
 
-model Holding {
-  id          String   @id @default(uuid())
-  symbol      String
-  shares      Float
-  averageCost Float
-  createdAt   DateTime @default(now())
-}
-
-model Strategy {
-  id          String   @id @default(uuid())
-  name        String
-  timeframe   String
-  entry       String
-  exit        String
-  riskPercent Float
-  status      String   @default("active")
-  createdAt   DateTime @default(now())
-}
-
-model SharedPortfolio {
+model AiMemory {
   id        String   @id @default(uuid())
-  snapshot  Json
+  category  String
+  content   String
+  symbol    String   @default("GLOBAL")
+  source    String   @default("user_pinned")
+  pinned    Boolean  @default(false)
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ChatInteraction {
+  id        String   @id @default(uuid())
+  symbol    String
+  prompt    String
+  response  String
   createdAt DateTime @default(now())
 }
+
+model ContextAttachment {
+  id        String   @id @default(uuid())
+  title     String
+  content   String
+  symbol    String   @default("GLOBAL")
+  scope     String   @default("symbol")
+  createdAt DateTime @default(now())
+}
+

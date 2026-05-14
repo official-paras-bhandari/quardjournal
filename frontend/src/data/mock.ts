@@ -1,4 +1,4 @@
-import type { Candle, Holding, JournalEntry, NewsItem, StrategyRule, WatchSymbol } from "../lib/types";
+import type { Candle, NewsItem, WatchSymbol } from "../lib/types";
 
 export const watchlist: WatchSymbol[] = [
   { symbol: "NVDA", name: "NVIDIA Corporation", venue: "NASDAQ", last: 220.78, change: 8.15, changePercent: 3.83, volume: "159.18M", marketCap: "5.36T", nextEarnings: "In 8 days" },
@@ -61,63 +61,4 @@ export const news: NewsItem[] = [
     timestamp: "07:20",
     summary: "Relative weakness is visible against the broader semiconductor basket."
   }
-];
-
-export const initialJournal: JournalEntry[] = [
-  {
-    id: "j1",
-    symbol: "NVDA",
-    type: "investment",
-    side: "long",
-    status: "open",
-    entry: 192.01,
-    size: 20,
-    pnl: 575.4,
-    thesis: "Weekly trend remains above the rising moving average and AI capex narrative is intact.",
-    emotion: "calm",
-    tags: ["weekly", "AI", "core"],
-    createdAt: "2026-05-10"
-  },
-  {
-    id: "j2",
-    symbol: "TSLA",
-    type: "trade",
-    side: "long",
-    status: "closed",
-    entry: 448.2,
-    exit: 476.7,
-    size: 8,
-    pnl: 228,
-    thesis: "Momentum continuation after reclaiming the prior supply zone.",
-    emotion: "confident",
-    tags: ["breakout", "momentum"],
-    createdAt: "2026-05-06"
-  }
-];
-
-export const initialStrategies: StrategyRule[] = [
-  {
-    id: "s1",
-    name: "Weekly SMC Continuation",
-    timeframe: "1W",
-    entry: "Close above prior weekly BOS with price holding the 20 EMA.",
-    exit: "Trim into supply, exit on weekly close below structure low.",
-    riskPercent: 1.5,
-    status: "active"
-  },
-  {
-    id: "s2",
-    name: "News Shock Pullback",
-    timeframe: "1h",
-    entry: "High-impact news, first pullback into VWAP, relative strength vs sector.",
-    exit: "Stop below news impulse low, target 2R then trail.",
-    riskPercent: 0.75,
-    status: "draft"
-  }
-];
-
-export const initialHoldings: Holding[] = [
-  { id: "h1", symbol: "NVDA", shares: 20, averageCost: 192.01 },
-  { id: "h2", symbol: "MSFT", shares: 12, averageCost: 552.45 },
-  { id: "h3", symbol: "AAPL", shares: 18, averageCost: 251.2 }
 ];
